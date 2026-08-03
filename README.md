@@ -1,4 +1,5 @@
-![image](https://github.com/lexsaints/powershell/blob/master/IMG/ps2.png)
+![image](https://github.com/Afeng-git/-/blob/main/manager.png)
+
 菁云镜像部署系统 0.21.1 龙芯组播/个性化测试版（无HTTP、无数据库）
 =================================================
 

@@ -1,0 +1,33 @@
+ZOS 0.21.1 多架构启动文件来源
+================================
+
+ARM64维护环境
+-------------
+来源：FOGProject/fos release 20260730
+页面：https://github.com/FOGProject/fos/releases/tag/20260730
+内核：arm_Image
+SHA-256：6daa2f2d9b54ecb842c97b52e81abc41bce9f02ce9f9acbaff737327d8e123df
+上游initramfs：arm_init.cpio.gz
+SHA-256：716be054f9406c43fc304c7d2b12eaccca599e9d93e24d1b2156f57f00160e70
+说明：包内init.cpio.gz是在该上游根文件系统中替换启动脚本并加入ZOS代理后重新生成，
+因此成品哈希与上游initramfs不同。FOG FOS具体许可证以其项目发布内容为准。
+
+龙芯LoongArch64维护环境
+-----------------------
+来源：openEuler 24.03 LTS OS loongarch64官方PXE目录
+目录：https://repo.openeuler.org/openEuler-24.03-LTS/OS/loongarch64/images/pxeboot/
+内核：vmlinuz
+SHA-256：60dd7631d5d8f8251c704d60122cb83e3937db50bdc359011de64cb3a0296b9a
+上游initrd：initrd.img
+SHA-256：02d56564efe98d0ee666ef5dc23e6adf92a470da7eab4834ea9b47465c59bdc4
+说明：包内initrd.xz是在该上游安装环境中加入ZOS Python代理和专用systemd target后重新生成，
+因此成品哈希与上游initrd不同。openEuler软件包许可证以发行版相应源码包为准。
+
+iPXE架构识别
+------------
+DHCP体系结构值采用iPXE头文件定义：ARM64=0x000b、LoongArch32=0x0025、
+LoongArch64=0x0027。第二阶段使用iPXE buildarch值arm64和loong64选择维护文件。
+文档：https://ipxe.org/cfg/buildarch
+源码：https://github.com/ipxe/ipxe/blob/master/src/include/ipxe/dhcp.h
+
+本文件中的哈希用于确认下载的上游输入，构建脚本tools/build_multiarch_images.py会在重打包前强制核对。

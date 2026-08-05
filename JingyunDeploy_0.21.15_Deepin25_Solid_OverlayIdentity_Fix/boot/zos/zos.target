@@ -1,0 +1,6 @@
+[Unit]
+Description=Jingyun ZOS LoongArch64 maintenance target
+Requires=basic.target
+After=basic.target
+Wants=zos-loongarch64.service
+AllowIsolate=yes

@@ -1,0 +1,256 @@
+#!/bin/bash
+
+# ZOS ARM64 network startup.
+# The iPXE address has already proved that this interface can reach the ZOS
+# server because it downloaded the kernel and initramfs.  When those values are
+# present, restore them as a static hand-off and NEVER run DHCP on that boot.
+# This prevents another DHCP server on the same Layer-2 network from replacing
+# the deployment address after Linux takes control of the VirtIO NIC.
+
+set +e
+
+read_zos_cmdline() {
+    local token key value
+    for token in $(cat /proc/cmdline 2>/dev/null); do
+        case "$token" in
+            jy_mode=*|jy_server=*|jy_port=*|jy_token=*|jy_auto=*|mac=*|\
+            jy_client_ip=*|jy_netmask=*|jy_gateway=*|jy_dns=*)
+                key=${token%%=*}
+                value=${token#*=}
+                export "$key=$value"
+                ;;
+        esac
+    done
+}
+
+valid_ipv4() {
+    local value="$1" a b c d octet
+    IFS=. read -r a b c d <<<"$value"
+    [[ -n "$a" && -n "$b" && -n "$c" && -n "$d" ]] || return 1
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( octet >= 0 && octet <= 255 )) || return 1
+    done
+}
+
+mask_to_prefix() {
+    local mask="$1" a b c d octet prefix=0 seen_partial=0 bits
+    IFS=. read -r a b c d <<<"$mask"
+    for octet in "$a" "$b" "$c" "$d"; do
+        case "$octet" in
+            255) bits=8 ;;
+            254) bits=7 ;;
+            252) bits=6 ;;
+            248) bits=5 ;;
+            240) bits=4 ;;
+            224) bits=3 ;;
+            192) bits=2 ;;
+            128) bits=1 ;;
+            0)   bits=0 ;;
+            *) return 1 ;;
+        esac
+        if (( seen_partial == 1 && bits != 0 )); then
+            return 1
+        fi
+        (( bits < 8 )) && seen_partial=1
+        prefix=$((prefix + bits))
+    done
+    echo "$prefix"
+}
+
+has_ipxe_lease() {
+    valid_ipv4 "${jy_client_ip:-}" && valid_ipv4 "${jy_netmask:-}"
+}
+
+write_network_state() {
+    local iface="$1" ip_addr="$2" method="$3" prefix="${4:-}"
+    mkdir -p /run
+    {
+        printf 'ZOS_IFACE=%q\n' "$iface"
+        printf 'ZOS_IPV4=%q\n' "$ip_addr"
+        printf 'ZOS_PREFIX=%q\n' "$prefix"
+        printf 'ZOS_GATEWAY=%q\n' "${jy_gateway:-}"
+        printf 'ZOS_NETWORK_METHOD=%q\n' "$method"
+    } > /run/zos-network.env
+}
+
+get_iface_ipv4() {
+    local iface="$1" value state_iface="" state_ip=""
+    [[ -n "$iface" ]] || return 1
+
+    if [[ -f /run/zos-network.env ]]; then
+        # shellcheck disable=SC1091
+        source /run/zos-network.env 2>/dev/null || true
+        state_iface="${ZOS_IFACE:-}"
+        state_ip="${ZOS_IPV4:-}"
+        if [[ "$state_iface" == "$iface" ]] && valid_ipv4 "$state_ip"; then
+            printf '%s\n' "$state_ip"
+            return 0
+        fi
+    fi
+
+    if command -v ifconfig >/dev/null 2>&1; then
+        value=$(ifconfig "$iface" 2>/dev/null |
+            sed -n -e 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' \
+                   -e 's/^[[:space:]]*inet[[:space:]]\+\([0-9.][0-9.]*\).*/\1/p' |
+            head -n 1)
+        if valid_ipv4 "$value"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+
+    value=$(/sbin/ip addr show dev "$iface" 2>/dev/null |
+        awk '$1 == "inet" {sub(/\/.*/, "", $2); print $2; exit}')
+    if valid_ipv4 "$value"; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    if valid_ipv4 "${jy_server:-}"; then
+        value=$(/sbin/ip route get "$jy_server" 2>/dev/null |
+            awk '{for (i=1; i<=NF; i++) if ($i == "src" && i < NF) {print $(i+1); exit}}')
+        if valid_ipv4 "$value"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+configure_ipxe_lease() {
+    local iface="$1" prefix
+    has_ipxe_lease || return 1
+    prefix=$(mask_to_prefix "$jy_netmask") || return 1
+
+    echo "Restoring iPXE lease on $iface: ${jy_client_ip}/${prefix}"
+
+    # Stop any old DHCP client before touching the address.  Most importantly,
+    # no DHCP client is started after a valid iPXE hand-off was supplied.
+    killall udhcpc 2>/dev/null || true
+    /sbin/ip link set "$iface" up 2>/dev/null || return 1
+    /sbin/ip addr flush dev "$iface" scope global 2>/dev/null || true
+
+    if ! /sbin/ip addr add "${jy_client_ip}/${prefix}" dev "$iface" 2>/dev/null; then
+        # BusyBox ip variants differ. ifconfig is a safe fallback for the
+        # address itself; routes are still installed with ip below.
+        ifconfig "$iface" "$jy_client_ip" netmask "$jy_netmask" up 2>/dev/null || return 1
+    fi
+
+    if valid_ipv4 "${jy_gateway:-}" && [[ "$jy_gateway" != "0.0.0.0" ]]; then
+        /sbin/ip route replace default via "$jy_gateway" dev "$iface" 2>/dev/null || true
+    fi
+
+    # The manager route is the only route registration actually needs. Keep it
+    # pinned to the PXE interface/address even if another default route exists.
+    if valid_ipv4 "${jy_server:-}"; then
+        /sbin/ip route replace "${jy_server}/32" dev "$iface" src "$jy_client_ip" 2>/dev/null || true
+    fi
+
+    if [[ -n "${jy_dns:-}" ]]; then
+        : > /etc/resolv.conf
+        for dns in ${jy_dns//,/ }; do
+            valid_ipv4 "$dns" && echo "nameserver $dns" >> /etc/resolv.conf
+        done
+    fi
+
+    # The address-add operation succeeded, so record the exact handed-off
+    # address directly. Do not reject it because a minimal BusyBox ip applet
+    # formats its output differently.
+    write_network_state "$iface" "$jy_client_ip" "ipxe-static" "$prefix"
+    echo "Network ready from iPXE hand-off: $iface = ${jy_client_ip}/${prefix}"
+    return 0
+}
+
+configure_dhcp() {
+    local iface="$1" retry ip_addr
+    killall udhcpc 2>/dev/null || true
+    for retry in 1 2 3 4; do
+        echo "DHCP attempt $retry on $iface"
+        /sbin/udhcpc -i "$iface" -n -q -t 6 -T 2 \
+            -s /usr/share/udhcpc/default.script 2>&1
+        ip_addr=$(get_iface_ipv4 "$iface" 2>/dev/null || true)
+        if valid_ipv4 "$ip_addr"; then
+            write_network_state "$iface" "$ip_addr" "dhcp" ""
+            echo "DHCP network ready: $iface = $ip_addr"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+read_zos_cmdline
+mkdir -p /run /etc/network
+{
+    echo "auto lo"
+    echo "iface lo inet loopback"
+    echo
+} > /etc/network/interfaces
+/sbin/ip addr add 127.0.0.1/8 dev lo 2>/dev/null || true
+/sbin/ip link set lo up 2>/dev/null || true
+
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=15 2>/dev/null || true
+sleep 1
+
+wanted_mac=$(printf '%s' "${mac:-}" | tr '[:upper:]' '[:lower:]' | tr '-' ':')
+preferred=""
+others=""
+
+for path in /sys/class/net/*; do
+    [[ -e "$path" ]] || continue
+    iface=${path##*/}
+    [[ "$iface" == "lo" ]] && continue
+    address=$(cat "$path/address" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$wanted_mac" && "$address" == "$wanted_mac" ]]; then
+        preferred="$preferred $iface"
+    else
+        others="$others $iface"
+    fi
+done
+
+ifaces="$preferred $others"
+if [[ -z "${ifaces// /}" ]]; then
+    echo "ERROR: no Ethernet interface was detected."
+    exit 1
+fi
+
+for iface in $ifaces; do
+    [[ -e "/sys/class/net/$iface" ]] || continue
+    echo "Starting $iface and waiting for carrier"
+    /sbin/ip link set "$iface" up 2>/dev/null || continue
+
+    count=0
+    carrier=0
+    while (( count < 30 )); do
+        if [[ ! -e "/sys/class/net/$iface/carrier" ]]; then
+            carrier=1
+            break
+        fi
+        carrier=$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || echo 0)
+        [[ "$carrier" == "1" ]] && break
+        count=$((count + 1))
+        sleep 1
+    done
+    if [[ "$carrier" != "1" ]]; then
+        echo "No carrier on $iface; trying the next interface."
+        continue
+    fi
+
+    if has_ipxe_lease; then
+        if configure_ipxe_lease "$iface"; then
+            exit 0
+        fi
+        echo "ERROR: iPXE supplied ${jy_client_ip}/${jy_netmask}, but it could not be restored on $iface."
+        echo "DHCP fallback is intentionally disabled for this boot to prevent address replacement."
+        continue
+    fi
+
+    configure_dhcp "$iface" && exit 0
+done
+
+echo "ERROR: failed to configure IPv4 on:$ifaces"
+/sbin/ip link show 2>/dev/null || true
+/sbin/ip addr show 2>/dev/null || true
+/sbin/ip route show 2>/dev/null || true
+exit 1

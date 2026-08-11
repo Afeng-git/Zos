@@ -1,0 +1,2493 @@
+#!/bin/bash
+
+# Capture/deploy ZOS agent for Jingyun Standalone.
+# No HTTP and no database are used. Control and image data use one TCP service.
+
+set -o pipefail
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+VERSION="0.22.6"
+SERVER="${jy_server:-}"
+PORT="${jy_port:-8090}"
+TOKEN="${jy_token:-}"
+MODE="${jy_mode:-}"
+AUTO="${jy_auto:-0}"
+MAC="${mac:-}"
+TASK_ID=""
+
+is_valid_ipv4() {
+    local value="$1" a b c d octet
+    IFS=. read -r a b c d <<<"$value"
+    [[ -n "$a" && -n "$b" && -n "$c" && -n "$d" ]] || return 1
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( octet >= 0 && octet <= 255 )) || return 1
+    done
+}
+
+get_iface_ipv4() {
+    local iface="$1" value state_iface="" state_ip=""
+    [[ -n "$iface" ]] || return 1
+
+    # The network startup script is authoritative. It records the exact
+    # address after a successful iPXE static hand-off or DHCP configuration.
+    if [[ -f /run/zos-network.env ]]; then
+        # shellcheck disable=SC1091
+        source /run/zos-network.env 2>/dev/null || true
+        state_iface="${ZOS_IFACE:-}"
+        state_ip="${ZOS_IPV4:-}"
+        if [[ "$state_iface" == "$iface" ]] && is_valid_ipv4 "$state_ip"; then
+            printf '%s\n' "$state_ip"
+            return 0
+        fi
+    fi
+
+    if command -v ifconfig >/dev/null 2>&1; then
+        value=$(ifconfig "$iface" 2>/dev/null |
+            sed -n -e 's/.*inet addr:\([0-9.][0-9.]*\).*/\1/p' \
+                   -e 's/^[[:space:]]*inet[[:space:]]\+\([0-9.][0-9.]*\).*/\1/p' |
+            head -n 1)
+        if is_valid_ipv4 "$value"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+
+    value=$(/sbin/ip addr show dev "$iface" 2>/dev/null |
+        awk '$1 == "inet" {sub(/\/.*/, "", $2); print $2; exit}')
+    if is_valid_ipv4 "$value"; then
+        printf '%s\n' "$value"
+        return 0
+    fi
+
+    if is_valid_ipv4 "${SERVER:-}"; then
+        value=$(/sbin/ip route get "$SERVER" 2>/dev/null |
+            awk '{for (i=1; i<=NF; i++) if ($i == "src" && i < NF) {print $(i+1); exit}}')
+        if is_valid_ipv4 "$value"; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+banner() {
+    clear
+    echo "Jingyun ZOS standalone imaging agent ${VERSION}"
+    echo "------------------------------------------------------------"
+}
+
+network_summary() {
+    local iface ip_addr method
+    [[ -f /run/zos-network.env ]] && source /run/zos-network.env 2>/dev/null || true
+    iface="${ZOS_IFACE:-$(/sbin/ip route 2>/dev/null | awk '/default/ {print $5; exit}')}"
+    [[ -n "$iface" ]] || iface=$(ls /sys/class/net 2>/dev/null | awk '$0 != "lo" {print; exit}')
+    ip_addr=$(get_iface_ipv4 "$iface" 2>/dev/null || true)
+    method="${ZOS_NETWORK_METHOD:-unknown}"
+    echo "Network: interface=${iface:-none}, IPv4=${ip_addr:-none}, method=${method}" >&2
+    /sbin/ip route 2>/dev/null | sed 's/^/Route:   /' >&2 || true
+}
+
+network_state_ready() {
+    local iface ip_addr
+    [[ -f /run/zos-network.env ]] || return 1
+    # shellcheck disable=SC1091
+    source /run/zos-network.env 2>/dev/null || return 1
+    iface="${ZOS_IFACE:-}"
+    ip_addr="${ZOS_IPV4:-}"
+    [[ -n "$iface" && -e "/sys/class/net/$iface" ]] || return 1
+    is_valid_ipv4 "$ip_addr" || return 1
+    return 0
+}
+
+ensure_local_network() {
+    local iface ip_addr
+
+    # A valid recorded iPXE hand-off must not be disturbed. In particular, do
+    # not rerun udhcpc after 192.168.x.x was restored, because another DHCP
+    # server may answer with an unrelated subnet.
+    if network_state_ready; then
+        return 0
+    fi
+
+    [[ -f /run/zos-network.env ]] && source /run/zos-network.env 2>/dev/null || true
+    iface="${ZOS_IFACE:-$(/sbin/ip route 2>/dev/null | awk '/default/ {print $5; exit}')}"
+    [[ -n "$iface" ]] || iface=$(ls /sys/class/net 2>/dev/null | awk '$0 != "lo" {print; exit}')
+    ip_addr=$(get_iface_ipv4 "$iface" 2>/dev/null || true)
+    if is_valid_ipv4 "$ip_addr"; then
+        return 0
+    fi
+
+    echo "No recorded IPv4 state; running network setup once..." >&2
+    /etc/init.d/S40network start >&2 || true
+    network_state_ready || {
+        network_summary
+        return 1
+    }
+    return 0
+}
+
+tcp_json() {
+    local payload="$1" attempt response rc error_file
+    error_file="/tmp/zos-socat-${$}.err"
+    for attempt in 1 2 3 4 5 6; do
+        if ! ensure_local_network; then
+            echo "Manager connection attempt ${attempt}/6 skipped: local network is not ready" >&2
+            sleep 2
+            continue
+        fi
+        response=$(printf '%s\n' "$payload" | socat - "TCP:${SERVER}:${PORT},connect-timeout=5" 2>"$error_file")
+        rc=$?
+        if [[ $rc -eq 0 ]]; then
+            rm -f "$error_file"
+            printf '%s\n' "$response"
+            return 0
+        fi
+        echo "Manager connection attempt ${attempt}/6 failed: $(tail -n 1 "$error_file" 2>/dev/null)" >&2
+        # Do not restart networking on a TCP failure. The PXE address is fixed
+        # for this boot and repeatedly invoking DHCP can replace it.
+        if [[ $attempt -eq 1 || $attempt -eq 6 ]]; then
+            network_summary
+        fi
+        sleep 2
+    done
+    rm -f "$error_file"
+    return 1
+}
+
+detect_mac() {
+    local iface value
+    if [[ "$MAC" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+        echo "${MAC,,}"
+        return
+    fi
+    for iface in /sys/class/net/*; do
+        [[ "${iface##*/}" == "lo" ]] && continue
+        value=$(cat "$iface/address" 2>/dev/null)
+        if [[ "$value" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+            echo "${value,,}"
+            return
+        fi
+    done
+}
+
+detect_disk() {
+    local requested="$1" min_bytes="${2:-0}" candidate candidates name size sectors ro removable
+    local best="" best_score=-1 score part_count fs_info disk_count=0
+    if [[ "$requested" != "auto" && -b "$requested" ]]; then
+        size=$(blockdev --getsize64 "$requested" 2>/dev/null)
+        if [[ "${size:-0}" -gt 0 ]]; then
+            echo "$requested"
+            return
+        fi
+    fi
+    candidates=$(
+        lsblk -bdnpo NAME,TYPE,SIZE,RO,RM 2>/dev/null |
+        awk '
+            $2 == "disk" &&
+            $3 > 0 &&
+            $4 == 0 &&
+            $5 == 0 &&
+            $1 !~ /^\/dev\/(nbd|loop|ram|sr|fd|zram|rbd)/ {
+                print $1, $3
+            }
+        '
+    )
+    if [[ -n "$candidates" ]]; then
+        echo "Eligible physical disks:" >&2
+        while read -r candidate size; do
+            [[ -b "$candidate" && "${size:-0}" -gt 0 ]] || continue
+            if [[ "$requested" == "auto" && "$size" -lt "$min_bytes" ]]; then
+                echo "  ${candidate}  size=${size}  skipped=smaller-than-image" >&2
+                continue
+            fi
+            let disk_count+=1
+            score=0
+            part_count=$(lsblk -lnpo TYPE "$candidate" 2>/dev/null | awk '$1=="part" {count++} END {print count+0}')
+            fs_info=$(lsblk -lnpo FSTYPE,PARTTYPE "$candidate" 2>/dev/null)
+            let score+=part_count*2
+            grep -Eqi 'ntfs' <<<"$fs_info" && let score+=50
+            grep -Eqi 'ext[234]|xfs|btrfs' <<<"$fs_info" && let score+=45
+            grep -Eqi 'vfat|fat32' <<<"$fs_info" && let score+=20
+            grep -Eqi 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' <<<"$fs_info" && let score+=30
+            grep -Eqi 'swap' <<<"$fs_info" && let score+=5
+            [[ $part_count -gt 1 ]] && let score+=10
+            echo "  ${candidate}  size=${size}  partitions=${part_count}  system-score=${score}" >&2
+            if [[ $score -gt $best_score ]]; then
+                best="$candidate"
+                best_score=$score
+            fi
+        done <<<"$candidates"
+        if [[ -n "$best" ]]; then
+            echo "Selected disk: ${best} (${disk_count} eligible disk(s), score=${best_score})" >&2
+            echo "$best"
+            return
+        fi
+    fi
+    for candidate in /sys/block/*; do
+        name="${candidate##*/}"
+        case "$name" in
+            nbd*|loop*|ram*|sr*|fd*|zram*|rbd*) continue ;;
+        esac
+        [[ -b "/dev/$name" ]] || continue
+        sectors=$(cat "$candidate/size" 2>/dev/null)
+        ro=$(cat "$candidate/ro" 2>/dev/null)
+        removable=$(cat "$candidate/removable" 2>/dev/null)
+        if [[ "${sectors:-0}" -gt 0 && "$((sectors * 512))" -ge "$min_bytes" &&
+              "${ro:-0}" -eq 0 && "${removable:-0}" -eq 0 ]]; then
+            echo "/dev/$name"
+            return
+        fi
+    done
+}
+
+report_failure() {
+    local message="$1" payload
+    echo "ERROR: ${message}"
+    if [[ -n "$TASK_ID" ]]; then
+        payload=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg message "$message" \
+            '{op:"fail",token:$token,task_id:$task_id,message:$message}')
+        tcp_json "$payload" >/dev/null 2>&1 || true
+    fi
+    return 1
+}
+
+notify_deploy_started() {
+    local payload response
+    payload=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg mac "$MAC" \
+        '{op:"deploy_started",token:$token,task_id:$task_id,mac:$mac}')
+    response=$(tcp_json "$payload") || return 1
+    [[ $(jq -r '.ok // false' <<<"$response") == "true" ]]
+}
+
+send_deploy_progress() {
+    local written="$1" payload
+    [[ "$written" =~ ^[0-9]+$ ]] || return 0
+    payload=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg mac "$MAC" \
+        --argjson written_bytes "$written" \
+        '{op:"deploy_progress",token:$token,task_id:$task_id,mac:$mac,
+          written_bytes:$written_bytes}')
+    tcp_json "$payload" >/dev/null 2>&1 || true
+}
+
+read_dd_status_progress() {
+    local value
+    [[ -n "${PROGRESS_STATUS_FILE:-}" && -s "$PROGRESS_STATUS_FILE" ]] || return 1
+
+    # ARM64 FOS contains /usr/bin/awk -> gawk, while some rebuilt initramfs
+    # versions accidentally left the gawk hard-link as an empty file.  Never
+    # put that parser in dd's stderr path: if it exits, the pipe eventually
+    # fills and dd itself receives SIGPIPE.  Parse a regular status file with
+    # the BusyBox awk applet instead, so parser failure cannot stop disk writes.
+    value=$(
+        /bin/busybox tr '\r' '\n' <"$PROGRESS_STATUS_FILE" 2>/dev/null |
+            /bin/busybox awk '
+                $1 ~ /^[0-9]+$/ && $2 == "bytes" {last=$1}
+                END {if (last != "") print last}
+            ' 2>/dev/null
+    )
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$value"
+}
+
+refresh_written_progress() {
+    local current
+    current=$(read_dd_status_progress 2>/dev/null) || return 0
+    echo "$current" >"$PROGRESS_FILE"
+}
+
+print_written_progress() {
+    local current="$1" source_bytes="$2"
+    local current_mib10 source_mib10 permille
+    [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    [[ "$source_bytes" =~ ^[0-9]+$ && "$source_bytes" -gt 0 ]] || return 0
+    [[ "$current" -gt "$source_bytes" ]] && current="$source_bytes"
+    current_mib10=$(( current * 10 / 1048576 ))
+    source_mib10=$(( source_bytes * 10 / 1048576 ))
+    permille=$(( current * 1000 / source_bytes ))
+    # Carriage return updates the same console row. ESC[K clears characters
+    # left over from a longer previous value.
+    printf '\rWritten %d.%d/%d.%d MiB (%d.%d%%)\033[K' \
+        "$((current_mib10 / 10))" "$((current_mib10 % 10))" \
+        "$((source_mib10 / 10))" "$((source_mib10 % 10))" \
+        "$((permille / 10))" "$((permille % 10))"
+}
+
+start_progress_reporter() {
+    local source_bytes="$1"
+    PROGRESS_FILE="/tmp/zos-progress-${TASK_ID}"
+    PROGRESS_STOP="/tmp/zos-progress-${TASK_ID}.stop"
+    PROGRESS_STATUS_FILE="/tmp/zos-dd-status-${TASK_ID}"
+    rm -f "$PROGRESS_FILE" "$PROGRESS_STOP" "$PROGRESS_STATUS_FILE"
+    echo 0 >"$PROGRESS_FILE"
+    : >"$PROGRESS_STATUS_FILE"
+    (
+        local current=0 previous=-1
+        while [[ ! -f "$PROGRESS_STOP" ]]; do
+            refresh_written_progress
+            current=$(cat "$PROGRESS_FILE" 2>/dev/null)
+            [[ "$current" =~ ^[0-9]+$ ]] || current=0
+            [[ "$current" -gt "$source_bytes" ]] && current="$source_bytes"
+            if [[ "$current" -ne "$previous" ]]; then
+                print_written_progress "$current" "$source_bytes"
+                previous="$current"
+            fi
+            # Send a heartbeat even when disk writing is temporarily stalled so
+            # the manager can keep each client's elapsed time current.
+            send_deploy_progress "$current"
+            sleep 3
+        done
+        refresh_written_progress
+        current=$(cat "$PROGRESS_FILE" 2>/dev/null)
+        [[ "$current" =~ ^[0-9]+$ ]] || current=0
+        [[ "$current" -gt "$source_bytes" ]] && current="$source_bytes"
+        send_deploy_progress "$current"
+    ) &
+    PROGRESS_REPORTER_PID=$!
+}
+
+stop_progress_reporter() {
+    local success="$1" source_bytes="$2" current
+    refresh_written_progress
+    echo stop >"$PROGRESS_STOP"
+    wait "$PROGRESS_REPORTER_PID" 2>/dev/null || true
+    if [[ "$success" == "1" ]]; then
+        current="$source_bytes"
+        echo "$current" >"$PROGRESS_FILE"
+        send_deploy_progress "$current"
+    else
+        refresh_written_progress
+        current=$(cat "$PROGRESS_FILE" 2>/dev/null || echo 0)
+        [[ "$current" =~ ^[0-9]+$ ]] || current=0
+    fi
+    print_written_progress "$current" "$source_bytes"
+    printf '\n'
+}
+
+read_written_progress() {
+    local value=0 attempt
+    for attempt in 1 2 3; do
+        refresh_written_progress
+        value=$(cat "$PROGRESS_FILE" 2>/dev/null || echo 0)
+        [[ "$value" =~ ^[0-9]+$ ]] || value=0
+        [[ "$value" -gt 0 ]] && break
+        sleep 1
+    done
+    printf '%s\n' "$value"
+}
+
+deploy_pipeline_complete() {
+    local source_bytes="$1" written_bytes="$2" request_rc="$3"
+    local transport_rc="$4" decoder_rc="$5" writer_rc="$6"
+
+    [[ "$source_bytes" =~ ^[0-9]+$ && "$source_bytes" -gt 0 ]] || return 1
+    [[ "$written_bytes" =~ ^[0-9]+$ ]] || return 1
+    [[ "$request_rc" -eq 0 && "$decoder_rc" -eq 0 && "$writer_rc" -eq 0 ]] || return 1
+
+    # socat/udp-receiver can receive SIGPIPE after zstd has consumed a complete
+    # frame and dd has already written the exact source disk size.  In that
+    # situation the transport status is 141 although the image is complete.
+    # Never ignore a decoder or writer error, and never accept a short write.
+    [[ "$written_bytes" -ge "$source_bytes" ]] || return 1
+    [[ "$transport_rc" -eq 0 || "$transport_rc" -eq 141 ]] || return 1
+    return 0
+}
+
+perform_post_action() {
+    local action="$1" count
+    case "$action" in
+        reboot)
+            echo
+            echo "Task succeeded. This computer will reboot automatically."
+            sync
+            for count in 5 4 3 2 1; do
+                echo "Rebooting in ${count}..."
+                sleep 1
+            done
+            reboot -f
+            ;;
+        shutdown)
+            echo
+            echo "Task succeeded. This computer will power off automatically."
+            sync
+            for count in 5 4 3 2 1; do
+                echo "Powering off in ${count}..."
+                sleep 1
+            done
+            poweroff -f || halt -f
+            ;;
+        *)
+            echo "Task succeeded. Staying in the ZOS maintenance environment."
+            ;;
+    esac
+}
+
+client_identity() {
+    local iface raw_inventory client_arch cpu_model cpu_cores mem_bytes
+    MAC=$(detect_mac)
+    [[ -f /run/zos-network.env ]] && source /run/zos-network.env 2>/dev/null || true
+    CLIENT_IFACE="${ZOS_IFACE:-$(/sbin/ip route 2>/dev/null | awk '/default/ {print $5; exit}')}"
+    [[ -n "$CLIENT_IFACE" ]] || CLIENT_IFACE=$(ls /sys/class/net 2>/dev/null | awk '$0 != "lo" {print; exit}')
+    CLIENT_IP=$(get_iface_ipv4 "$CLIENT_IFACE" 2>/dev/null || true)
+    CLIENT_HOSTNAME="zosclient.localdomain"
+    hostname "$CLIENT_HOSTNAME" 2>/dev/null || true
+    raw_inventory=$(lsblk -b -J -o NAME,PATH,TYPE,SIZE,FSTYPE,PTTYPE,PARTUUID 2>/dev/null || echo '{}')
+    client_arch=$(uname -m 2>/dev/null || echo unknown)
+    cpu_model=$(awk -F: '/model name|Hardware/ {print $2;exit}' /proc/cpuinfo 2>/dev/null)
+    cpu_cores=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)
+    mem_bytes=$(awk '/MemTotal/{print $2*1024;exit}' /proc/meminfo 2>/dev/null)
+    CLIENT_INVENTORY=$(jq -c --arg a "$client_arch" --arg c "$cpu_model" --argjson n "${cpu_cores:-0}" --argjson m "${mem_bytes:-0}" '.+{arch:$a,system:("ZOS "+$a),cpu_model:$c,cpu_cores:$n,memory_bytes:$m}' <<<"$raw_inventory")
+}
+
+claim_task() {
+    local mode="$1" claim response
+    claim=$(jq -nc --arg token "$TOKEN" --arg mac "$MAC" --arg hostname "$CLIENT_HOSTNAME" \
+        --arg ip "$CLIENT_IP" --arg mode "$mode" --arg automatic "$AUTO" \
+        --argjson inventory "$CLIENT_INVENTORY" \
+        '{op:"claim",token:$token,mode:$mode,automatic:($automatic=="1"),
+          mac:$mac,hostname:$hostname,ip:$ip,inventory:$inventory}')
+    response=$(tcp_json "$claim") || {
+        report_failure "Cannot connect to manager TCP service"
+        return 1
+    }
+    [[ $(jq -r '.ok // false' <<<"$response") == "true" ]] || {
+        report_failure "$(jq -r '.error // "Manager rejected client"' <<<"$response")"
+        return 1
+    }
+    CLAIM_RESPONSE="$response"
+}
+
+select_registration_group() {
+    local payload response answer choice count selected
+    payload=$(jq -nc --arg token "$TOKEN" '{op:"groups",token:$token}')
+    response=$(tcp_json "$payload") || response=""
+    if [[ $(jq -r '.ok // false' <<<"$response" 2>/dev/null) != "true" ]]; then
+        REGISTRATION_GROUP="Default"
+        echo "Manager group list is unavailable. Using group: ${REGISTRATION_GROUP}"
+        return
+    fi
+
+    REGISTRATION_GROUP=$(jq -r '.default_group // "Default"' <<<"$response")
+    while true; do
+        printf 'Group [%s] (Enter=default, ?=list): ' "$REGISTRATION_GROUP"
+        IFS= read -r answer || answer=""
+        [[ -z "$answer" ]] && return
+        [[ "$answer" == "?" ]] && break
+        echo "Press Enter for the default group, or type ? to list manager groups."
+    done
+
+    echo "Groups from manager:"
+    jq -r '.groups | to_entries[] | "  \(.key + 1)) \(.value)"' <<<"$response"
+    count=$(jq -r '.groups | length' <<<"$response")
+    while true; do
+        printf 'Select group number [1]: '
+        IFS= read -r choice || choice=""
+        choice="${choice:-1}"
+        if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$count" ]]; then
+            selected=$(jq -r --argjson index "$((choice - 1))" '.groups[$index] // empty' <<<"$response")
+            if [[ -n "$selected" ]]; then
+                REGISTRATION_GROUP="$selected"
+                return
+            fi
+        fi
+        echo "Invalid group number. Try again."
+    done
+}
+
+registration_power_menu() {
+    local choice
+    echo
+    echo "Registration finished. Choose the next action:"
+    echo "  1) Reboot"
+    echo "  2) Power off"
+    while true; do
+        printf 'Select [1-2]: '
+        IFS= read -r choice || return 0
+        case "$choice" in
+            1)
+                sync
+                echo "Rebooting..."
+                reboot -f
+                return
+                ;;
+            2)
+                sync
+                echo "Powering off..."
+                poweroff -f || halt -f
+                return
+                ;;
+            *) echo "Please enter 1 or 2." ;;
+        esac
+    done
+}
+
+register_main() {
+    local payload response entered_name
+    echo "[1/3] Client information"
+    printf 'Client name [%s]: ' "$CLIENT_HOSTNAME"
+    IFS= read -r entered_name || entered_name=""
+    REGISTRATION_NAME="${entered_name:-$CLIENT_HOSTNAME}"
+    select_registration_group
+
+    echo "[2/3] Registering ${MAC} with ${SERVER}:${PORT}..."
+    payload=$(jq -nc --arg token "$TOKEN" --arg mac "$MAC" --arg hostname "$CLIENT_HOSTNAME" \
+        --arg name "$REGISTRATION_NAME" --arg group "$REGISTRATION_GROUP" \
+        --arg ip "$CLIENT_IP" --argjson inventory "$CLIENT_INVENTORY" \
+        '{op:"register",token:$token,mac:$mac,hostname:$hostname,name:$name,group:$group,
+          ip:$ip,inventory:$inventory}')
+    response=$(tcp_json "$payload") || {
+        report_failure "Cannot connect to manager TCP service"
+        return 1
+    }
+    [[ $(jq -r '.ok // false' <<<"$response") == "true" ]] || {
+        report_failure "$(jq -r '.error // "Registration failed"' <<<"$response")"
+        return 1
+    }
+    echo "[3/3] Registration completed"
+    echo "MAC:      ${MAC}"
+    echo "Name:     ${REGISTRATION_NAME}"
+    echo "Group:    ${REGISTRATION_GROUP}"
+    echo "Hostname: ${CLIENT_HOSTNAME}"
+    echo "IP:       ${CLIENT_IP}"
+    echo
+    echo "Set the next boot action in the manager, then reboot this computer."
+    echo "If no task is assigned, the PXE menu will boot the local disk automatically."
+    registration_power_menu
+}
+
+validate_common() {
+    [[ -n "$SERVER" && -n "$PORT" && -n "$TOKEN" ]] || {
+        report_failure "Missing manager IP, TCP port or token"
+        return 1
+    }
+    command -v socat >/dev/null 2>&1 || {
+        report_failure "ZOS environment has no socat"
+        return 1
+    }
+    command -v jq >/dev/null 2>&1 || {
+        report_failure "ZOS environment has no jq"
+        return 1
+    }
+    command -v zstd >/dev/null 2>&1 || {
+        report_failure "ZOS environment has no zstd"
+        return 1
+    }
+    ensure_local_network || {
+        report_failure "No usable IPv4 network was configured"
+        return 1
+    }
+    network_summary
+    client_identity
+    [[ -n "$MAC" ]] || {
+        report_failure "No usable Ethernet MAC address found"
+        return 1
+    }
+}
+
+install_windows_identity() {
+    local root="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7"
+    local network_mode="${8:-}"
+    [[ -n "$network_mode" ]] ||
+        network_mode=$([[ -n "$address" ]] && echo static || echo unchanged)
+    local windows_dir="" system_hive="" software_hive="" zos_dir=""
+    local system_reg="" software_reg="" select_reg="" verify_reg=""
+    local candidate label hex number control_set primary_set="" startup_dir=""
+    local -a control_sets=()
+    for candidate in "$root/Windows" "$root/WINDOWS" "$root/windows"; do
+        if [[ -d "$candidate/System32/config" ]]; then
+            windows_dir="$candidate"
+            break
+        fi
+    done
+    [[ -n "$windows_dir" ]] || {
+        IDENTITY_MESSAGE="Mounted NTFS partition does not contain a Windows system directory"
+        return 1
+    }
+    system_hive="$windows_dir/System32/config/SYSTEM"
+    [[ -f "$system_hive" ]] || system_hive="$windows_dir/system32/config/system"
+    [[ -f "$system_hive" ]] || {
+        IDENTITY_MESSAGE="Windows SYSTEM registry hive was not found"
+        return 1
+    }
+    software_hive="$windows_dir/System32/config/SOFTWARE"
+    [[ -f "$software_hive" ]] || software_hive="$windows_dir/system32/config/software"
+    [[ -f "$software_hive" ]] || {
+        IDENTITY_MESSAGE="Windows SOFTWARE registry hive was not found"
+        return 1
+    }
+    command -v reged >/dev/null 2>&1 || {
+        IDENTITY_MESSAGE="ZOS environment has no offline registry editor"
+        return 1
+    }
+
+    # Windows\\Temp always exists on an installed Windows system. Keeping the
+    # files here also lets the no-mount NTFS fallback create them with ntfscp.
+    zos_dir="$windows_dir/Temp"
+    mkdir -p "$zos_dir"
+    cat >"$zos_dir/ZOSFirstBoot.cmd" <<'EOF'
+@echo off
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\ZOSFirstBoot.ps1 >>C:\Windows\Temp\ZOSFirstBoot.log 2>&1
+exit /b %errorlevel%
+EOF
+    cat >"$zos_dir/ZOSFirstBoot.ps1" <<EOF
+\$ErrorActionPreference = "Stop"
+\$LogFile = "C:\\Windows\\Temp\\ZOSFirstBoot.log"
+\$TargetName = "${name}"
+\$TargetIp = "${address}"
+\$Prefix = ${prefix}
+\$Gateway = "${gateway}"
+\$DnsText = "${dns}"
+\$TargetMac = "${target_mac}".Replace(":","").Replace("-","").ToUpper()
+\$Server = "${SERVER}"
+\$Port = ${PORT}
+\$Token = "${TOKEN}"
+\$TaskId = "${TASK_ID}"
+\$ClientMac = "${target_mac}"
+
+function Escape-ZosJson([string]\$Text) {
+    if (\$null -eq \$Text) { return "" }
+    return \$Text.Replace("\\", "\\\\").Replace('"', '\\"').Replace(([string][char]13), " ").Replace(([string][char]10), " ")
+}
+function Send-ZosIdentityResult([bool]\$Ok, [string]\$Message, [string]\$ActualName, [string]\$ActualIp) {
+    try {
+        \$okText = if (\$Ok) { "true" } else { "false" }
+        \$line = '{"op":"identity_result","token":"' + (Escape-ZosJson \$Token) +
+            '","task_id":"' + (Escape-ZosJson \$TaskId) +
+            '","mac":"' + (Escape-ZosJson \$ClientMac) +
+            '","ok":' + \$okText +
+            ',"message":"' + (Escape-ZosJson \$Message) +
+            '","actual_name":"' + (Escape-ZosJson \$ActualName) +
+            '","actual_ip":"' + (Escape-ZosJson \$ActualIp) + '"}' + [char]10
+        \$client = New-Object System.Net.Sockets.TcpClient
+        \$async = \$client.BeginConnect(\$Server, \$Port, \$null, \$null)
+        if (-not \$async.AsyncWaitHandle.WaitOne(3000, \$false)) {
+            \$client.Close()
+            return
+        }
+        \$client.EndConnect(\$async)
+        \$bytes = [System.Text.Encoding]::UTF8.GetBytes(\$line)
+        \$stream = \$client.GetStream()
+        \$stream.Write(\$bytes, 0, \$bytes.Length)
+        \$stream.Flush()
+        \$client.Close()
+    } catch {
+        Add-Content -Path \$LogFile -Value ("Result report failed: " + \$_.Exception.Message)
+    }
+}
+
+try {
+    Add-Content -Path \$LogFile -Value ("ZOS identity start " + (Get-Date -Format s))
+    \$adapter = \$null
+    for (\$attempt = 1; \$attempt -le 24 -and -not \$adapter; \$attempt++) {
+        \$configs = Get-WmiObject Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue
+        \$adapter = \$configs |
+            Where-Object {
+                \$_.MACAddress -and
+                ((\$_.MACAddress -replace "[:-]","").ToUpper() -eq \$TargetMac)
+            } |
+            Select-Object -First 1
+        if (-not \$adapter) { Start-Sleep -Seconds 5 }
+    }
+    if (-not \$adapter) { throw "The registered MAC was not found after 120 seconds" }
+
+    \$bits = ("1" * \$Prefix).PadRight(32, "0")
+    \$Mask = ((0..3) | ForEach-Object {
+        [Convert]::ToInt32(\$bits.Substring(\$_ * 8, 8), 2)
+    }) -join "."
+    \$result = \$adapter.EnableStatic(@(\$TargetIp), @(\$Mask))
+    if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+        throw "EnableStatic failed with WMI code \$((\$result.ReturnValue))"
+    }
+    if (\$Gateway) {
+        \$gatewayResult = \$adapter.SetGateways(@(\$Gateway), @(1))
+        if (\$gatewayResult.ReturnValue -ne 0 -and \$gatewayResult.ReturnValue -ne 1) {
+            throw "SetGateways failed with WMI code \$((\$gatewayResult.ReturnValue))"
+        }
+    }
+    if (\$DnsText) {
+        \$dns = \$DnsText.Split(",") | Where-Object { \$_ }
+        \$dnsResult = \$adapter.SetDNSServerSearchOrder([string[]]\$dns)
+        if (\$dnsResult.ReturnValue -ne 0 -and \$dnsResult.ReturnValue -ne 1) {
+            throw "SetDNSServerSearchOrder failed with WMI code \$((\$dnsResult.ReturnValue))"
+        }
+    }
+
+    \$needsRestart = \$false
+    if (\$env:COMPUTERNAME -ne \$TargetName) {
+        \$computer = Get-WmiObject Win32_ComputerSystem -ErrorAction Stop
+        \$rename = \$computer.Rename(\$TargetName)
+        if (\$rename.ReturnValue -ne 0) {
+            throw "Rename failed with WMI code \$((\$rename.ReturnValue))"
+        }
+        \$needsRestart = \$true
+    }
+    New-Item -ItemType Directory -Force -Path C:\\ProgramData | Out-Null
+    "Configured name=\$TargetName ip=\$TargetIp/\$Prefix at \$(Get-Date -Format s)" |
+        Set-Content -Encoding ASCII C:\\ProgramData\\ZOSDeployIdentity.done
+    Send-ZosIdentityResult \$true "Windows name and static IP were applied" \$TargetName \$TargetIp
+    & reg.exe delete "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" /v ZOSFirstBoot /f 2>\$null
+    & sc.exe config ZOSFirstBoot start= disabled 2>\$null
+    & sc.exe delete ZOSFirstBoot 2>\$null
+    Remove-Item -Force -ErrorAction SilentlyContinue "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\ZOSFirstBoot.cmd"
+    if (\$needsRestart) {
+        shutdown.exe /r /t 10 /c "ZOS computer name and IP configuration completed"
+    }
+    exit 0
+} catch {
+    \$errorText = \$_.Exception.Message
+    Add-Content -Path \$LogFile -Value ("ERROR: " + \$errorText)
+    Send-ZosIdentityResult \$false \$errorText \$env:COMPUTERNAME ""
+    exit 1
+}
+EOF
+    unix2dos "$zos_dir/ZOSFirstBoot.cmd" "$zos_dir/ZOSFirstBoot.ps1" >/dev/null 2>&1 || true
+
+    # Determine the control sets Windows will actually use. 0.17.0 only wrote
+    # ControlSet001/002, which fails when Select\\Current points elsewhere.
+    select_reg="/tmp/zos-select-${TASK_ID}.reg"
+    rm -f "$select_reg"
+    reged -x "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' '\Select' "$select_reg" \
+        >/tmp/zos-reged-select.log 2>&1 || true
+    for label in Current Default LastKnownGood; do
+        hex=$(sed -n "s/^\\\"${label}\\\"=dword:\\([0-9A-Fa-f][0-9A-Fa-f]*\\).*/\\1/p" \
+            "$select_reg" 2>/dev/null | head -n 1)
+        if [[ -n "$hex" ]]; then
+            number=$((16#$hex))
+            control_set=$(printf 'ControlSet%03d' "$number")
+            if [[ ! " ${control_sets[*]} " =~ " ${control_set} " ]]; then
+                control_sets+=("$control_set")
+            fi
+        fi
+    done
+    if [[ ${#control_sets[@]} -eq 0 ]]; then
+        control_sets=(ControlSet001 ControlSet002 ControlSet003)
+    fi
+    primary_set="${control_sets[0]}"
+
+    system_reg="/tmp/zos-system-identity-${TASK_ID}.reg"
+    cat >"$system_reg" <<'EOF'
+Windows Registry Editor Version 5.00
+EOF
+    for control_set in "${control_sets[@]}"; do
+        cat >>"$system_reg" <<EOF
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Control\\ComputerName\\ComputerName]
+"ComputerName"="${name}"
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Control\\ComputerName\\ActiveComputerName]
+"ComputerName"="${name}"
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Services\\Tcpip\\Parameters]
+"Hostname"="${name}"
+"NV Hostname"="${name}"
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Services\\ZOSFirstBoot]
+"DisplayName"="ZOS First Boot Identity"
+"ImagePath"="C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\\\\Windows\\\\Temp\\\\ZOSFirstBoot.ps1"
+"ObjectName"="LocalSystem"
+"Type"=dword:00000010
+"Start"=dword:00000002
+"DelayedAutoStart"=dword:00000001
+"ErrorControl"=dword:00000001
+EOF
+    done
+    reged -C -I "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' "$system_reg" \
+        >/tmp/zos-reged-system.log 2>&1 || {
+        IDENTITY_MESSAGE="Could not update the offline Windows registry: $(tail -n 1 /tmp/zos-reged-system.log)"
+        return 1
+    }
+
+    software_reg="/tmp/zos-software-identity-${TASK_ID}.reg"
+    cat >"$software_reg" <<EOF
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run]
+"ZOSFirstBoot"="C:\\\\Windows\\\\System32\\\\cmd.exe /c C:\\\\Windows\\\\Temp\\\\ZOSFirstBoot.cmd"
+EOF
+    reged -C -I "$software_hive" 'HKEY_LOCAL_MACHINE\SOFTWARE' "$software_reg" \
+        >/tmp/zos-reged-software.log 2>&1 || {
+        IDENTITY_MESSAGE="Could not install the Windows identity retry trigger: $(tail -n 1 /tmp/zos-reged-software.log)"
+        return 1
+    }
+
+    # A Startup copy is a third retry path for images where third-party tools
+    # disable unknown automatic services. The script removes itself on success.
+    startup_dir="$root/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup"
+    mkdir -p "$startup_dir"
+    cp -f "$zos_dir/ZOSFirstBoot.cmd" "$startup_dir/ZOSFirstBoot.cmd"
+
+    verify_reg="/tmp/zos-verify-${TASK_ID}.reg"
+    rm -f "$verify_reg"
+    reged -x "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' \
+        "\\${primary_set}\\Services\\ZOSFirstBoot" "$verify_reg" \
+        >/tmp/zos-reged-verify.log 2>&1 || {
+        IDENTITY_MESSAGE="Windows registry verification failed after import"
+        return 1
+    }
+    grep -q 'ZOSFirstBoot' "$verify_reg" || {
+        IDENTITY_MESSAGE="Windows first-boot trigger was not present after registry import"
+        return 1
+    }
+    sync
+    IDENTITY_MESSAGE="Windows active control set ${primary_set} updated; service and logon retry triggers installed"
+    return 0
+}
+
+deepin_solid_profile_uuid() {
+    local target_mac="$1" mac_hex
+    mac_hex=$(printf '%s' "$target_mac" | tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')
+    mac_hex="${mac_hex:0:12}"
+    while ((${#mac_hex} < 12)); do mac_hex="0${mac_hex}"; done
+    printf '00000000-0000-4000-8000-%s\n' "$mac_hex"
+}
+
+write_deepin_solid_etc_layer() {
+    local etc_root="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7" network_mode="$8"
+    local mac_hex profile_id profile_uuid profile_file dns_key address_line
+    local q_name q_mode q_address q_prefix q_gateway q_dns q_mac q_server q_port
+    local q_token q_task q_profile_id q_profile_file q_done_file q_log_file script service
+
+    mkdir -p "$etc_root" || return 1
+    if [[ -n "$name" ]]; then
+        printf '%s\n' "$name" >"$etc_root/hostname" || return 1
+        chmod 0644 "$etc_root/hostname" 2>/dev/null || true
+        # Only update hosts when this modification layer already contains a copy.
+        # Creating a new hosts file here would mask lower-layer custom entries.
+        if [[ -f "$etc_root/hosts" ]]; then
+            if grep -qE '^127\.0\.1\.1[[:space:]]' "$etc_root/hosts"; then
+                sed -i "s/^127\\.0\\.1\\.1.*/127.0.1.1 ${name}/" "$etc_root/hosts"
+            else
+                printf '127.0.1.1 %s\n' "$name" >>"$etc_root/hosts"
+            fi
+        fi
+    fi
+
+    mac_hex=$(printf '%s' "$target_mac" | tr -cd '0-9A-Fa-f' | tr 'A-F' 'a-f')
+    mac_hex="${mac_hex:0:12}"
+    while ((${#mac_hex} < 12)); do mac_hex="0${mac_hex}"; done
+    profile_id="ZOS-${mac_hex}"
+    profile_uuid=$(deepin_solid_profile_uuid "$target_mac")
+    profile_file="/etc/NetworkManager/system-connections/zos-identity-${mac_hex}.nmconnection"
+
+    if [[ "$network_mode" == "static" || "$network_mode" == "dhcp" ]]; then
+        mkdir -p "$etc_root/NetworkManager/system-connections" || return 1
+        rm -f "$etc_root/NetworkManager/system-connections"/zos-identity-*.nmconnection 2>/dev/null || true
+        if [[ "$network_mode" == "static" ]]; then
+            [[ -n "$address" ]] || return 1
+            address_line="${address}/${prefix}"
+            [[ -n "$gateway" ]] && address_line+="${address_line:+,}${gateway}"
+            dns_key="${dns//,/;}"
+            [[ -n "$dns_key" && "$dns_key" != *';' ]] && dns_key+=";"
+            cat >"$etc_root/NetworkManager/system-connections/zos-identity-${mac_hex}.nmconnection" <<EOF_PROFILE
+[connection]
+id=${profile_id}
+uuid=${profile_uuid}
+type=ethernet
+autoconnect=true
+autoconnect-priority=999
+multi-connect=0
+
+[ethernet]
+mac-address=${target_mac}
+
+[ipv4]
+method=manual
+address1=${address_line}
+dns=${dns_key}
+ignore-auto-dns=true
+may-fail=false
+route-metric=10
+
+[ipv6]
+method=auto
+may-fail=true
+EOF_PROFILE
+        else
+            cat >"$etc_root/NetworkManager/system-connections/zos-identity-${mac_hex}.nmconnection" <<EOF_PROFILE
+[connection]
+id=${profile_id}
+uuid=${profile_uuid}
+type=ethernet
+autoconnect=true
+autoconnect-priority=999
+multi-connect=0
+
+[ethernet]
+mac-address=${target_mac}
+
+[ipv4]
+method=auto
+ignore-auto-dns=false
+may-fail=false
+route-metric=10
+
+[ipv6]
+method=auto
+may-fail=true
+EOF_PROFILE
+        fi
+        chmod 0600 "$etc_root/NetworkManager/system-connections/zos-identity-${mac_hex}.nmconnection" || return 1
+    fi
+
+    mkdir -p "$etc_root/zos" "$etc_root/systemd/system/multi-user.target.wants" || return 1
+    script="$etc_root/zos/zos-firstboot-identity.sh"
+    service="$etc_root/systemd/system/zos-firstboot-identity.service"
+    printf -v q_name '%q' "$name"
+    printf -v q_mode '%q' "$network_mode"
+    printf -v q_address '%q' "$address"
+    printf -v q_prefix '%q' "$prefix"
+    printf -v q_gateway '%q' "$gateway"
+    printf -v q_dns '%q' "$dns"
+    printf -v q_mac '%q' "$target_mac"
+    printf -v q_server '%q' "$SERVER"
+    printf -v q_port '%q' "$PORT"
+    printf -v q_token '%q' "$TOKEN"
+    printf -v q_task '%q' "$TASK_ID"
+    printf -v q_profile_id '%q' "$profile_id"
+    printf -v q_profile_file '%q' "$profile_file"
+    printf -v q_done_file '%q' "/var/lib/zos/deploy-identity-${TASK_ID}.done"
+    printf -v q_log_file '%q' "/var/lib/zos/deploy-identity-${TASK_ID}.log"
+    cat >"$script" <<EOF_SCRIPT
+#!/bin/bash
+set -u
+NAME=${q_name}
+MODE=${q_mode}
+ADDRESS=${q_address}
+PREFIX=${q_prefix}
+GATEWAY=${q_gateway}
+DNS=${q_dns}
+TARGET_MAC=${q_mac}
+SERVER=${q_server}
+PORT=${q_port}
+TOKEN=${q_token}
+TASK_ID=${q_task}
+PROFILE_ID=${q_profile_id}
+PROFILE_FILE=${q_profile_file}
+DONE_FILE=${q_done_file}
+LOG_FILE=${q_log_file}
+mkdir -p /var/lib/zos
+exec >>"\$LOG_FILE" 2>&1
+printf '%s identity start: task=%s name=%s mode=%s ip=%s/%s mac=%s\n' "\$(date -Is 2>/dev/null || date)" "\$TASK_ID" "\$NAME" "\$MODE" "\$ADDRESS" "\$PREFIX" "\$TARGET_MAC"
+report_identity() {
+    local ok="\$1" message="\$2" payload
+    payload="{\"op\":\"identity_result\",\"token\":\"\${TOKEN}\",\"task_id\":\"\${TASK_ID}\",\"mac\":\"\${TARGET_MAC}\",\"ok\":\${ok},\"message\":\"\${message}\",\"actual_name\":\"\${NAME}\",\"actual_ip\":\"\${ADDRESS}\"}"
+    if exec 9<>"/dev/tcp/\${SERVER}/\${PORT}" 2>/dev/null; then
+        printf '%s\\n' "\$payload" >&9
+        exec 9>&-; exec 9<&-
+    fi
+}
+disable_self() {
+    systemctl disable zos-firstboot-identity.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/multi-user.target.wants/zos-firstboot-identity.service
+}
+if [[ -f "\$DONE_FILE" ]]; then
+    disable_self
+    exit 0
+fi
+if [[ -n "\$NAME" ]]; then
+    printf '%s\\n' "\$NAME" >/etc/hostname 2>/dev/null || true
+    hostnamectl set-hostname "\$NAME" 2>/dev/null || hostname "\$NAME" 2>/dev/null || true
+fi
+if [[ "\$MODE" == "unchanged" ]]; then
+    mkdir -p /var/lib/zos
+    printf 'name=%s mode=%s ip=%s/%s\\n' "\$NAME" "\$MODE" "\$ADDRESS" "\$PREFIX" >"\$DONE_FILE"
+    report_identity true "Deepin Solid computer name was applied"
+    disable_self
+    exit 0
+fi
+iface=""
+for path in /sys/class/net/*; do
+    [[ "\${path##*/}" == "lo" ]] && continue
+    current=\$(cat "\$path/address" 2>/dev/null)
+    if [[ "\${current,,}" == "\${TARGET_MAC,,}" ]]; then iface="\${path##*/}"; break; fi
+done
+[[ -n "\$iface" ]] || iface=\$(ip route 2>/dev/null | awk '/default/ {print \$5; exit}')
+[[ -n "\$iface" ]] || iface=\$(ls /sys/class/net 2>/dev/null | awk '\$1 != "lo" {print; exit}')
+configured=0
+failure="NetworkManager did not apply the registered identity profile"
+if command -v nmcli >/dev/null 2>&1 && [[ -n "\$iface" ]]; then
+    nmcli connection reload >/dev/null 2>&1 || true
+    [[ ! -f "\$PROFILE_FILE" ]] || nmcli connection load "\$PROFILE_FILE" >/dev/null 2>&1 || true
+    if nmcli --wait 45 connection up "\$PROFILE_ID" ifname "\$iface" >/tmp/zos-identity-nmcli.log 2>&1; then
+        configured=1
+    else
+        failure="NetworkManager profile \$PROFILE_ID failed: \$(tail -n 1 /tmp/zos-identity-nmcli.log 2>/dev/null)"
+    fi
+else
+    failure="NetworkManager or the registered Ethernet interface was not available"
+fi
+if [[ "\$configured" != "1" ]]; then
+    report_identity false "\$failure"
+    exit 1
+fi
+mkdir -p /var/lib/zos
+printf 'name=%s mode=%s ip=%s/%s\\n' "\$NAME" "\$MODE" "\$ADDRESS" "\$PREFIX" >"\$DONE_FILE"
+report_identity true "Deepin Solid name/network settings were applied"
+disable_self
+exit 0
+EOF_SCRIPT
+    chmod 0755 "$script" || return 1
+    cat >"$service" <<'EOF_SERVICE'
+[Unit]
+Description=ZOS first boot identity configuration for Deepin Solid
+Wants=NetworkManager.service
+After=NetworkManager.service
+Before=network-online.target
+ConditionPathExists=/etc/zos/zos-firstboot-identity.sh
+
+[Service]
+Type=oneshot
+ExecStartPre=-/sbin/restorecon /etc/zos/zos-firstboot-identity.sh
+ExecStart=/bin/bash /etc/zos/zos-firstboot-identity.sh
+TimeoutStartSec=150
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+    ln -sfn ../zos-firstboot-identity.service \
+        "$etc_root/systemd/system/multi-user.target.wants/zos-firstboot-identity.service"
+    return 0
+}
+
+install_deepin_solid_overlay_tree() {
+    local overlay_root="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7" network_mode="$8"
+    local entry etc_root key seen="|" count=0
+    local -a targets=()
+
+    [[ -d "$overlay_root" ]] || return 1
+    for entry in "$overlay_root"/layer-*; do
+        [[ -d "$entry" ]] || continue
+        targets+=("$entry/etc")
+    done
+    for entry in "$overlay_root"/*; do
+        [[ -d "$entry" ]] || continue
+        [[ "${entry##*/}" == layer-* ]] && continue
+        if [[ -d "$entry/etc" ]]; then
+            targets+=("$entry/etc")
+        fi
+        if [[ -d "$entry/etc-upper" || -d "$entry/etc-work" ||
+              -d "$entry/usr-upper" || "${entry##*/}" =~ ^[0-9a-fA-F]{32,64}\.[0-9]+$ ]]; then
+            targets+=("$entry/etc-upper")
+        fi
+    done
+
+    for etc_root in "${targets[@]}"; do
+        key="${etc_root%/}"
+        [[ "$seen" == *"|${key}|"* ]] && continue
+        seen+="${key}|"
+        if write_deepin_solid_etc_layer \
+            "$etc_root" "$name" "$address" "$prefix" "$gateway" "$dns" \
+            "$target_mac" "$network_mode"; then
+            count=$((count + 1))
+        fi
+    done
+    DEEPIN_SOLID_LAYER_COUNT="$count"
+    (( count > 0 ))
+}
+
+apply_deepin_solid_identity() {
+    local disk="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7" network_mode="$8"
+    local scan_root="/mnt/zos-deepin-scan" part fstype mount_dir overlay_root
+    local idx=0 total=0 mounted=0
+    local -a mount_cmd=()
+
+    rm -rf "$scan_root" 2>/dev/null || true
+    mkdir -p "$scan_root"
+    command -v timeout >/dev/null 2>&1 && mount_cmd=(timeout 20)
+    while read -r part; do
+        [[ -b "$part" ]] || continue
+        fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null)
+        case "$fstype" in ext2|ext3|ext4|xfs|btrfs) ;; *) continue ;; esac
+        idx=$((idx + 1))
+        mount_dir="$scan_root/$idx"
+        mkdir -p "$mount_dir"
+        if [[ "$fstype" == "xfs" ]]; then
+            "${mount_cmd[@]}" mount -t xfs -o rw,nouuid "$part" "$mount_dir" >/tmp/zos-deepin-mount.log 2>&1 || continue
+        elif [[ "$fstype" == "btrfs" ]]; then
+            "${mount_cmd[@]}" mount -t btrfs -o rw,subvolid=5 "$part" "$mount_dir" >/tmp/zos-deepin-mount.log 2>&1 || \
+                "${mount_cmd[@]}" mount -t btrfs -o rw "$part" "$mount_dir" >/tmp/zos-deepin-mount.log 2>&1 || continue
+        else
+            "${mount_cmd[@]}" mount -o rw "$part" "$mount_dir" >/tmp/zos-deepin-mount.log 2>&1 || continue
+        fi
+        mounted=1
+        while IFS= read -r overlay_root; do
+            [[ -d "$overlay_root" ]] || continue
+            if install_deepin_solid_overlay_tree \
+                "$overlay_root" "$name" "$address" "$prefix" "$gateway" "$dns" \
+                "$target_mac" "$network_mode"; then
+                total=$((total + DEEPIN_SOLID_LAYER_COUNT))
+            fi
+        done < <(
+            {
+                printf '%s\n' "$mount_dir/overlay/data" "$mount_dir/persistent/overlay/data"
+                find "$mount_dir" -xdev -maxdepth 6 -type d -path '*/overlay/data' 2>/dev/null
+            } | awk '!seen[$0]++'
+        )
+        "${mount_cmd[@]}" umount -l "$mount_dir" >/dev/null 2>&1 || umount -l "$mount_dir" >/dev/null 2>&1 || true
+        mounted=0
+    done < <(
+        lsblk -lnpo NAME,TYPE "$disk" 2>/dev/null |
+            awk '$2=="part" || $2=="lvm" || $2=="crypt" || $2 ~ /^raid/ || $2=="md" || $2=="disk" {print $1}' |
+            awk '!seen[$0]++'
+    )
+    (( mounted == 0 )) || umount -l "$mount_dir" >/dev/null 2>&1 || true
+    rmdir "$scan_root"/* "$scan_root" >/dev/null 2>&1 || true
+    if (( total > 0 )); then
+        sync
+        IDENTITY_MESSAGE="Deepin25 identity written to ${total} layers; applies on first boot"
+        return 0
+    fi
+    return 1
+}
+
+install_linux_identity() {
+    local root="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7"
+    local network_mode="${8:-}"
+    [[ -n "$network_mode" ]] ||
+        network_mode=$([[ -n "$address" ]] && echo static || echo unchanged)
+    local script_rel="/usr/local/sbin/zos-firstboot-identity.sh"
+    [[ "$root" == */ostree/deploy/*/deploy/*.0 ]] && script_rel="/etc/zos/zos-firstboot-identity.sh"
+    local script="$root$script_rel"
+    mkdir -p "${script%/*}" "$root/etc/systemd/system/multi-user.target.wants"
+    if [[ -n "$name" ]]; then
+        echo "$name" >"$root/etc/hostname"
+    fi
+    if [[ -n "$name" && -f "$root/etc/hosts" ]]; then
+        if grep -qE '^127\.0\.1\.1[[:space:]]' "$root/etc/hosts"; then
+            sed -i "s/^127\\.0\\.1\\.1.*/127.0.1.1 ${name}/" "$root/etc/hosts"
+        else
+            echo "127.0.1.1 ${name}" >>"$root/etc/hosts"
+        fi
+    fi
+    if [[ "$network_mode" == "unchanged" ]]; then
+        sync
+        IDENTITY_MESSAGE="Linux computer name ${name} was written offline; network configuration was preserved"
+        return 0
+    fi
+    cat >"$script" <<EOF
+#!/bin/bash
+set -u
+NAME="${name}"
+MODE="${network_mode}"
+ADDRESS="${address}"
+PREFIX="${prefix}"
+GATEWAY="${gateway}"
+DNS="${dns}"
+TARGET_MAC="${target_mac}"
+SERVER="${SERVER}"
+PORT="${PORT}"
+TOKEN="${TOKEN}"
+TASK_ID="${TASK_ID}"
+CLIENT_MAC="${target_mac}"
+report_identity() {
+    local ok="\$1" message="\$2" payload
+    payload="{\"op\":\"identity_result\",\"token\":\"\${TOKEN}\",\"task_id\":\"\${TASK_ID}\",\"mac\":\"\${CLIENT_MAC}\",\"ok\":\${ok},\"message\":\"\${message}\",\"actual_name\":\"\${NAME}\",\"actual_ip\":\"\${ADDRESS}\"}"
+    if exec 9<>"/dev/tcp/\${SERVER}/\${PORT}" 2>/dev/null; then
+        printf '%s\\n' "\$payload" >&9
+        exec 9>&-
+        exec 9<&-
+    fi
+}
+if [[ -n "\$NAME" ]]; then
+    hostnamectl set-hostname "\$NAME" 2>/dev/null || hostname "\$NAME" 2>/dev/null || true
+fi
+iface=""
+for path in /sys/class/net/*; do
+    [[ "\${path##*/}" == "lo" ]] && continue
+    current=\$(cat "\$path/address" 2>/dev/null)
+    if [[ "\${current,,}" == "\${TARGET_MAC,,}" ]]; then iface="\${path##*/}"; break; fi
+done
+[[ -n "\$iface" ]] || iface=\$(ip route 2>/dev/null | awk '/default/ {print \$5; exit}')
+configured=0
+failure="No supported Linux network configuration backend was found"
+if command -v nmcli >/dev/null 2>&1 && [[ -n "\$iface" ]]; then
+    connection=\$(nmcli -g GENERAL.CONNECTION device show "\$iface" 2>/dev/null | head -n1)
+    if [[ -z "\$connection" || "\$connection" == "--" ]]; then
+        connection=\$(nmcli -t -f NAME,TYPE connection show 2>/dev/null |
+            awk -F: '\$2 == "802-3-ethernet" || \$2 == "ethernet" {print \$1; exit}')
+    fi
+    if [[ -z "\$connection" || "\$connection" == "--" ]]; then
+        connection="ZOS-\$iface"
+        nmcli connection add type ethernet ifname "\$iface" con-name "\$connection" \
+            802-3-ethernet.mac-address "\$TARGET_MAC" >/dev/null 2>&1 || connection=""
+    fi
+    if [[ -n "\$connection" && "\$connection" != "--" ]]; then
+        if [[ "\$MODE" == "dhcp" ]]; then
+            args=(ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns "")
+        else
+            args=(ipv4.method manual ipv4.addresses "\${ADDRESS}/\${PREFIX}")
+            args+=(ipv4.gateway "\$GATEWAY" ipv4.dns "\$DNS")
+        fi
+        if nmcli connection modify "\$connection" "\${args[@]}" &&
+            nmcli --wait 30 connection up "\$connection"; then
+            configured=1
+        else
+            failure="NetworkManager rejected the registered static IP"
+        fi
+    else
+        failure="NetworkManager has no connection for the registered MAC"
+    fi
+elif [[ -d /etc/sysconfig/network-scripts && -n "\$iface" ]]; then
+    cfg="/etc/sysconfig/network-scripts/ifcfg-\$iface"
+    touch "\$cfg"
+    sed -i '/^\(BOOTPROTO\|IPADDR\|PREFIX\|GATEWAY\|DNS1\|DNS2\)=/d' "\$cfg"
+    {
+        echo "DEVICE=\$iface"
+        echo "ONBOOT=yes"
+        if [[ "\$MODE" == "dhcp" ]]; then
+            echo "BOOTPROTO=dhcp"
+        else
+            echo "BOOTPROTO=none"
+            echo "IPADDR=\$ADDRESS"
+            echo "PREFIX=\$PREFIX"
+            [[ -n "\$GATEWAY" ]] && echo "GATEWAY=\$GATEWAY"
+            [[ -n "\$DNS" ]] && echo "DNS1=\${DNS%%,*}"
+            [[ "\$DNS" == *,* ]] && echo "DNS2=\${DNS#*,}"
+        fi
+    } >>"\$cfg"
+    configured=1
+elif [[ -d /etc/systemd/network && -n "\$iface" ]]; then
+    cat >/etc/systemd/network/10-zos-static.network <<NETWORK_EOF
+[Match]
+MACAddress=\${TARGET_MAC}
+
+[Network]
+\$(
+    if [[ "\$MODE" == "dhcp" ]]; then
+        echo "DHCP=yes"
+    else
+        echo "Address=\${ADDRESS}/\${PREFIX}"
+        [[ -n "\$GATEWAY" ]] && echo "Gateway=\$GATEWAY"
+        [[ -n "\$DNS" ]] && echo "DNS=\${DNS//,/ }"
+    fi
+)
+NETWORK_EOF
+    systemctl enable systemd-networkd.service >/dev/null 2>&1 || true
+    systemctl restart systemd-networkd.service >/dev/null 2>&1 || true
+    configured=1
+elif [[ -d /etc/network/interfaces.d && -n "\$iface" ]]; then
+    cat >/etc/network/interfaces.d/zos-static <<IFUPDOWN_EOF
+auto \${iface}
+\$(
+    if [[ "\$MODE" == "dhcp" ]]; then
+        echo "iface \${iface} inet dhcp"
+    else
+        echo "iface \${iface} inet static"
+        echo "    address \${ADDRESS}/\${PREFIX}"
+        [[ -n "\$GATEWAY" ]] && echo "    gateway \$GATEWAY"
+        [[ -n "\$DNS" ]] && echo "    dns-nameservers \${DNS//,/ }"
+    fi
+)
+IFUPDOWN_EOF
+    configured=1
+fi
+if [[ "\$configured" != "1" ]]; then
+    report_identity false "\$failure"
+    exit 1
+fi
+mkdir -p /var/lib/zos
+echo "name=\$NAME mode=\$MODE ip=\$ADDRESS/\$PREFIX" >/var/lib/zos/deploy-identity.done
+report_identity true "Linux name/network settings were applied"
+systemctl disable zos-firstboot-identity.service >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/multi-user.target.wants/zos-firstboot-identity.service
+exit 0
+EOF
+    chmod 0755 "$script"
+    cat >"$root/etc/systemd/system/zos-firstboot-identity.service" <<EOF
+[Unit]
+Description=ZOS first boot identity configuration
+Wants=network-online.target
+After=NetworkManager.service network-online.target
+
+[Service]
+Type=oneshot
+ExecStartPre=-/sbin/restorecon ${script_rel}
+ExecStart=/bin/bash ${script_rel}
+TimeoutStartSec=120
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ln -sf ../zos-firstboot-identity.service \
+        "$root/etc/systemd/system/multi-user.target.wants/zos-firstboot-identity.service"
+    sync
+    if [[ "$network_mode" == "dhcp" && -n "$name" ]]; then
+        IDENTITY_MESSAGE="Linux name was written offline; DHCP and automatic DNS will be applied by a one-time systemd service"
+    elif [[ "$network_mode" == "dhcp" ]]; then
+        IDENTITY_MESSAGE="Linux computer name was preserved; DHCP and automatic DNS will be applied by a one-time systemd service"
+    elif [[ -n "$name" ]]; then
+        IDENTITY_MESSAGE="Linux name was written offline; static IP, gateway and DNS will be applied by a one-time systemd service"
+    else
+        IDENTITY_MESSAGE="Linux computer name was preserved; static IP, gateway and DNS will be applied by a one-time systemd service"
+    fi
+    return 0
+}
+
+install_windows_identity_direct() {
+    local part="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7"
+    local network_mode="${8:-}"
+    [[ -n "$network_mode" ]] ||
+        network_mode=$([[ -n "$address" ]] && echo static || echo unchanged)
+    local direct_root="/tmp/zos-direct-${TASK_ID}"
+    local local_system="" local_software="" local_cmd="" local_ps1=""
+    local startup_local="" output=""
+
+    command -v ntfscat >/dev/null 2>&1 || {
+        IDENTITY_MESSAGE="ZOS environment has no ntfscat direct NTFS reader"
+        return 1
+    }
+    command -v ntfscp >/dev/null 2>&1 || {
+        IDENTITY_MESSAGE="ZOS environment has no ntfscp direct NTFS writer"
+        return 1
+    }
+    mkdir -p \
+        "$direct_root/Windows/System32/config" \
+        "$direct_root/Windows/Temp" \
+        "$direct_root/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup"
+    local_system="$direct_root/Windows/System32/config/SYSTEM"
+    local_software="$direct_root/Windows/System32/config/SOFTWARE"
+    local_cmd="$direct_root/Windows/Temp/ZOSFirstBoot.cmd"
+    local_ps1="$direct_root/Windows/Temp/ZOSFirstBoot.ps1"
+    startup_local="$direct_root/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/ZOSFirstBoot.cmd"
+
+    if ! ntfscat -f "$part" /Windows/System32/config/SYSTEM \
+        >"$local_system" 2>/tmp/zos-direct-ntfs.log; then
+        IDENTITY_MESSAGE="${part} is not the Windows system partition"
+        return 1
+    fi
+    if ! ntfscat -f "$part" /Windows/System32/config/SOFTWARE \
+        >"$local_software" 2>/tmp/zos-direct-ntfs.log; then
+        IDENTITY_MESSAGE="Cannot read the offline Windows SOFTWARE hive directly: $(tail -n 1 /tmp/zos-direct-ntfs.log)"
+        return 1
+    fi
+    if ! install_windows_identity \
+        "$direct_root" "$name" "$address" "$prefix" "$gateway" "$dns" "$target_mac"; then
+        return 1
+    fi
+
+    # Write scripts first and registry hives last, so Windows never sees a
+    # trigger that points to an incomplete script.
+    for output in \
+        "$local_cmd:/Windows/Temp/ZOSFirstBoot.cmd" \
+        "$local_ps1:/Windows/Temp/ZOSFirstBoot.ps1"; do
+        if ! ntfscp -f "$part" "${output%%:*}" "${output#*:}" \
+            >/tmp/zos-direct-ntfs.log 2>&1; then
+            IDENTITY_MESSAGE="Cannot write ${output#*:} directly: $(tail -n 1 /tmp/zos-direct-ntfs.log)"
+            return 1
+        fi
+    done
+    # This third trigger is optional; service and HKLM Run remain primary.
+    ntfscp -f "$part" "$startup_local" \
+        "/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/ZOSFirstBoot.cmd" \
+        >/tmp/zos-direct-startup.log 2>&1 || true
+    if ! ntfscp -f "$part" "$local_system" /Windows/System32/config/SYSTEM \
+        >/tmp/zos-direct-ntfs.log 2>&1; then
+        IDENTITY_MESSAGE="Cannot write the modified Windows SYSTEM hive directly: $(tail -n 1 /tmp/zos-direct-ntfs.log)"
+        return 1
+    fi
+    if ! ntfscp -f "$part" "$local_software" /Windows/System32/config/SOFTWARE \
+        >/tmp/zos-direct-ntfs.log 2>&1; then
+        IDENTITY_MESSAGE="Cannot write the modified Windows SOFTWARE hive directly: $(tail -n 1 /tmp/zos-direct-ntfs.log)"
+        return 1
+    fi
+    if ! ntfscat -f "$part" /Windows/Temp/ZOSFirstBoot.ps1 2>/tmp/zos-direct-verify.log |
+        grep -q "\\\$TargetName = \"${name}\""; then
+        IDENTITY_MESSAGE="Direct NTFS verification could not read back the Windows first-boot script"
+        return 1
+    fi
+    sync
+    IDENTITY_MESSAGE="Windows identity files and registry hives were written directly without mounting NTFS"
+    return 0
+}
+
+# Convert an IPv4 prefix length to the dotted mask used by the legacy Windows
+# TCP/IP registry format. This works in the BusyBox bash shipped in ZOS.
+prefix_to_mask() {
+    local prefix="${1:-24}" full rem index octet mask=""
+    [[ "$prefix" =~ ^[0-9]+$ ]] || prefix=24
+    (( prefix >= 0 && prefix <= 32 )) || prefix=24
+    full=$((prefix / 8))
+    rem=$((prefix % 8))
+    for index in 0 1 2 3; do
+        if (( index < full )); then
+            octet=255
+        elif (( index == full && rem > 0 )); then
+            octet=$((256 - (1 << (8 - rem))))
+        else
+            octet=0
+        fi
+        mask+="${mask:+.}${octet}"
+    done
+    printf '%s' "$mask"
+}
+
+# regedit REG_MULTI_SZ data is UTF-16LE and ends in two NUL characters.
+# IPv4 addresses and masks are ASCII, so no iconv dependency is needed.
+reg_multi_sz_hex() {
+    local value="$1" output="" index byte
+    if [[ -n "$value" ]]; then
+        LC_ALL=C
+        for ((index = 0; index < ${#value}; index++)); do
+            printf -v byte '%02x' "'${value:index:1}"
+            output+="${byte},00,"
+        done
+    fi
+    printf '%s00,00,00,00' "$output"
+}
+
+# ZOS early offline personalization for Windows 7 and newer.
+# Both the computer name and, when the captured adapter can be identified, its
+# static IPv4 settings are written directly into the offline SYSTEM hive.
+# A one-time Windows action remains only as a fallback when restored hardware
+# will enumerate a different adapter GUID.
+install_windows_identity() {
+    local root="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7"
+    local network_mode="${8:-}"
+    [[ -n "$network_mode" ]] ||
+        network_mode=$([[ -n "$address" ]] && echo static || echo unchanged)
+    local windows_dir="" system_hive="" software_hive=""
+    local candidate select_reg system_reg software_reg verify_reg
+    local label hex number control_set primary_set=""
+    local script_dir startup_dir ip_staged=0 offline_ip_written=0
+    local interfaces_reg interface_reg interface_verify interface_block
+    local software_verify
+    local interface_guid="" candidate_guid="" candidate_score=0 score value
+    local subnet_mask ip_hex mask_hex gateway_hex
+    local -a control_sets=()
+
+    for candidate in "$root/Windows" "$root/WINDOWS" "$root/windows"; do
+        if [[ -d "$candidate/System32/config" || -d "$candidate/system32/config" ]]; then
+            windows_dir="$candidate"
+            break
+        fi
+    done
+    [[ -n "$windows_dir" ]] || {
+        IDENTITY_MESSAGE="NTFS partition does not contain Windows"
+        return 1
+    }
+    system_hive="$windows_dir/System32/config/SYSTEM"
+    [[ -f "$system_hive" ]] || system_hive="$windows_dir/system32/config/system"
+    [[ -f "$system_hive" ]] || {
+        IDENTITY_MESSAGE="Windows SYSTEM registry hive was not found"
+        return 1
+    }
+    command -v reged >/dev/null 2>&1 || {
+        IDENTITY_MESSAGE="ZOS environment has no reged offline registry editor"
+        return 1
+    }
+
+    select_reg="/tmp/zos-early-select-${TASK_ID}.reg"
+    rm -f "$select_reg"
+    reged -x "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' '\Select' "$select_reg" \
+        >/tmp/zos-early-select.log 2>&1 || true
+    for label in Current Default LastKnownGood; do
+        hex=$(sed -n "s/^\\\"${label}\\\"=dword:\\([0-9A-Fa-f][0-9A-Fa-f]*\\).*/\\1/p" \
+            "$select_reg" 2>/dev/null | head -n 1)
+        if [[ -n "$hex" ]]; then
+            number=$((16#$hex))
+            control_set=$(printf 'ControlSet%03d' "$number")
+            [[ " ${control_sets[*]} " == *" ${control_set} "* ]] ||
+                control_sets+=("$control_set")
+        fi
+    done
+    # ZOS writes ControlSet001 and CurrentControlSet variants. Offline registry
+    # tools do not always expose CurrentControlSet as an alias, so also update
+    # the common numbered sets. Non-existent keys are harmless.
+    for control_set in ControlSet001 ControlSet002 ControlSet003; do
+        [[ " ${control_sets[*]} " == *" ${control_set} "* ]] ||
+            control_sets+=("$control_set")
+    done
+    primary_set="${control_sets[0]:-ControlSet001}"
+
+    if [[ -n "$name" ]]; then
+        system_reg="/tmp/zos-early-system-${TASK_ID}.reg"
+        cat >"$system_reg" <<'EOF'
+Windows Registry Editor Version 5.00
+EOF
+        for control_set in "${control_sets[@]}"; do
+            cat >>"$system_reg" <<EOF
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Control\\ComputerName\\ComputerName]
+"ComputerName"="${name}"
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Control\\ComputerName\\ActiveComputerName]
+"ComputerName"="${name}"
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Services\\Tcpip\\Parameters]
+"Hostname"="${name}"
+"NV Hostname"="${name}"
+EOF
+        done
+        # chntpw/reged on some ZOS builds returns a non-zero process status even
+        # after printing "OK" and committing the hive. Never trust that status;
+        # the read-back below is the authoritative success check.
+        reged -C -I "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' "$system_reg" \
+            >/tmp/zos-early-system.log 2>&1 || true
+
+        verify_reg="/tmp/zos-early-verify-${TASK_ID}.reg"
+        rm -f "$verify_reg"
+        reged -x "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' \
+            "\\${primary_set}\\Control\\ComputerName\\ComputerName" "$verify_reg" \
+            >/tmp/zos-early-verify.log 2>&1 || {
+            IDENTITY_MESSAGE="Offline hostname verification could not export ${primary_set}"
+            return 1
+        }
+        grep -Fq "\"ComputerName\"=\"${name}\"" "$verify_reg" || {
+            IDENTITY_MESSAGE="SYSTEM verify missing ${name}: $(tail -n 1 /tmp/zos-early-system.log)"
+            return 1
+        }
+    fi
+
+    # Prefer the interface that currently owns a DHCP lease. This is more
+    # reliable than picking the first GUID and makes the common same-model
+    # deployment path fully agentless.
+    if [[ "$network_mode" == "static" || "$network_mode" == "dhcp" ]]; then
+        interfaces_reg="/tmp/zos-early-interfaces-${TASK_ID}.reg"
+        rm -f "$interfaces_reg"
+        reged -x "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' \
+            "\\${primary_set}\\Services\\Tcpip\\Parameters\\Interfaces" \
+            "$interfaces_reg" >/tmp/zos-early-interfaces.log 2>&1 || true
+        while read -r candidate_guid; do
+            [[ -n "$candidate_guid" ]] || continue
+            interface_block=$(awk -v guid="$candidate_guid" '
+                /^\[/ {
+                    line = tolower($0)
+                    needle = tolower("\\" guid "]")
+                    active = index(line, needle) > 0
+                }
+                active { print }
+            ' "$interfaces_reg")
+            score=0
+            grep -qi '"EnableDHCP"=dword:00000001' <<<"$interface_block" &&
+                score=$((score + 20))
+            value=$(sed -n 's/^"DhcpIPAddress"="\([^"]*\)".*/\1/p' \
+                <<<"$interface_block" | head -n 1)
+            [[ -n "$value" && "$value" != "0.0.0.0" ]] &&
+                score=$((score + 20))
+            value=$(sed -n 's/^"DhcpServer"="\([^"]*\)".*/\1/p' \
+                <<<"$interface_block" | head -n 1)
+            [[ -n "$value" && "$value" != "255.255.255.255" &&
+               "$value" != "0.0.0.0" ]] && score=$((score + 10))
+            grep -qi '"LeaseObtainedTime"=' <<<"$interface_block" &&
+                score=$((score + 5))
+            if (( score > candidate_score )); then
+                candidate_score=$score
+                interface_guid="$candidate_guid"
+            fi
+        done < <(
+            grep -oE '\{[0-9A-Fa-f-]{36}\}' "$interfaces_reg" 2>/dev/null |
+                sort -u
+        )
+
+        if [[ -n "$interface_guid" && "$candidate_score" -gt 0 ]]; then
+            interface_reg="/tmp/zos-early-static-ip-${TASK_ID}.reg"
+            cat >"$interface_reg" <<EOF
+Windows Registry Editor Version 5.00
+EOF
+            if [[ "$network_mode" == "static" ]]; then
+                subnet_mask=$(prefix_to_mask "$prefix")
+                ip_hex=$(reg_multi_sz_hex "$address")
+                mask_hex=$(reg_multi_sz_hex "$subnet_mask")
+                gateway_hex=$(reg_multi_sz_hex "$gateway")
+                for control_set in "${control_sets[@]}"; do
+                    cat >>"$interface_reg" <<EOF
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Services\\Tcpip\\Parameters\\Interfaces\\${interface_guid}]
+"EnableDHCP"=dword:00000000
+"IPAutoconfigurationEnabled"=dword:00000000
+"IPAddress"=hex(7):${ip_hex}
+"SubnetMask"=hex(7):${mask_hex}
+"DefaultGateway"=hex(7):${gateway_hex}
+"NameServer"="${dns}"
+EOF
+                done
+            else
+                for control_set in "${control_sets[@]}"; do
+                    cat >>"$interface_reg" <<EOF
+
+[HKEY_LOCAL_MACHINE\\SYSTEM\\${control_set}\\Services\\Tcpip\\Parameters\\Interfaces\\${interface_guid}]
+"EnableDHCP"=dword:00000001
+"IPAutoconfigurationEnabled"=dword:00000001
+"IPAddress"=hex(7):00,00,00,00
+"SubnetMask"=hex(7):00,00,00,00
+"DefaultGateway"=hex(7):00,00,00,00
+"NameServer"=""
+EOF
+                done
+            fi
+            reged -C -I "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' \
+                "$interface_reg" >/tmp/zos-early-static-ip.log 2>&1 || true
+            interface_verify="/tmp/zos-early-static-ip-verify-${TASK_ID}.reg"
+            rm -f "$interface_verify"
+            reged -x "$system_hive" 'HKEY_LOCAL_MACHINE\SYSTEM' \
+                "\\${primary_set}\\Services\\Tcpip\\Parameters\\Interfaces\\${interface_guid}" \
+                "$interface_verify" >/tmp/zos-early-static-ip-verify.log 2>&1 || true
+            if grep -qi "\"EnableDHCP\"=dword:$(
+                [[ "$network_mode" == "static" ]] &&
+                    echo 00000000 || echo 00000001
+            )" "$interface_verify"; then
+                offline_ip_written=1
+            fi
+        fi
+
+        # Always stage a one-time MAC-based verification. Windows may create a
+        # new interface GUID when the RAW image starts on different hardware,
+        # which makes an otherwise valid offline registry edit apply only to
+        # the captured adapter. The action retries at logon and removes itself
+        # after it confirms that the registered MAC owns the requested IP.
+        software_hive="$windows_dir/System32/config/SOFTWARE"
+        [[ -f "$software_hive" ]] || software_hive="$windows_dir/system32/config/software"
+        if [[ -f "$software_hive" ]]; then
+            script_dir="$windows_dir/Temp"
+            mkdir -p "$script_dir"
+            cat >"$script_dir/ZOSApplyNetwork.cmd" <<'EOF'
+@echo off
+powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File C:\Windows\Temp\ZOSApplyNetwork.ps1 >>C:\Windows\Temp\ZOSApplyNetwork.log 2>&1
+set "ZOS_RC=%errorlevel%"
+if "%ZOS_RC%"=="0" del /f /q C:\Windows\Temp\ZOSApplyNetwork.ps1 >nul 2>&1
+if "%ZOS_RC%"=="0" del /f /q "%~f0" >nul 2>&1
+exit /b %ZOS_RC%
+EOF
+            cat >"$script_dir/ZOSApplyNetwork.ps1" <<EOF
+\$ErrorActionPreference = "Stop"
+\$NetworkMode = "${network_mode}"
+\$TargetIp = "${address}"
+\$Prefix = ${prefix}
+\$Gateway = "${gateway}"
+\$DnsText = "${dns}"
+\$TargetMac = "${target_mac}".Replace(":","").Replace("-","").ToUpper()
+\$Server = "${SERVER}"
+\$Port = ${PORT}
+\$Token = "${TOKEN}"
+\$TaskId = "${TASK_ID}"
+\$ClientMac = "${target_mac}"
+\$LogFile = "C:\\Windows\\Temp\\ZOSApplyNetwork.log"
+Write-Output ("START ZOS IPv4 configuration: mode=" + \$NetworkMode + " MAC=" + \$TargetMac + " IP=" + \$TargetIp)
+function Escape-ZosJson([string]\$Text) {
+    if (\$null -eq \$Text) { return "" }
+    return \$Text.Replace("\\", "\\\\").Replace('"', '\\"').Replace(([string][char]13), " ").Replace(([string][char]10), " ")
+}
+function Report-ZosResult([bool]\$Ok, [string]\$Message) {
+    try {
+        \$okText = if (\$Ok) { "true" } else { "false" }
+        \$line = '{"op":"identity_result","token":"' + (Escape-ZosJson \$Token) +
+            '","task_id":"' + (Escape-ZosJson \$TaskId) +
+            '","mac":"' + (Escape-ZosJson \$ClientMac) +
+            '","ok":' + \$okText +
+            ',"message":"' + (Escape-ZosJson \$Message) +
+            '","actual_name":"' + (Escape-ZosJson \$env:COMPUTERNAME) +
+            '","actual_ip":"' + (Escape-ZosJson \$TargetIp) + '"}' + [char]10
+        \$client = New-Object System.Net.Sockets.TcpClient
+        \$async = \$client.BeginConnect(\$Server, \$Port, \$null, \$null)
+        if (-not \$async.AsyncWaitHandle.WaitOne(5000, \$false)) { \$client.Close(); return }
+        \$client.EndConnect(\$async)
+        \$bytes = [System.Text.Encoding]::UTF8.GetBytes(\$line)
+        \$stream = \$client.GetStream()
+        \$stream.Write(\$bytes, 0, \$bytes.Length)
+        \$stream.Flush()
+        \$client.Close()
+    } catch {}
+}
+try {
+    \$adapter = \$null
+    for (\$attempt = 1; \$attempt -le 24 -and -not \$adapter; \$attempt++) {
+        \$adapter = Get-WmiObject Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue |
+            Where-Object {
+                \$_.MACAddress -and
+                ((\$_.MACAddress -replace "[:-]","").ToUpper() -eq \$TargetMac)
+            } | Select-Object -First 1
+        if (-not \$adapter) { Start-Sleep -Seconds 5 }
+    }
+    if (-not \$adapter) { throw "Registered physical MAC was not found" }
+    if (\$NetworkMode -eq "dhcp") {
+        \$result = \$adapter.EnableDHCP()
+        if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+            throw "EnableDHCP failed with WMI code \$((\$result.ReturnValue))"
+        }
+        \$result = \$adapter.SetGateways(\$null, \$null)
+        if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+            throw "Clear gateways failed with WMI code \$((\$result.ReturnValue))"
+        }
+        \$result = \$adapter.SetDNSServerSearchOrder(\$null)
+        if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+            throw "Enable automatic DNS failed with WMI code \$((\$result.ReturnValue))"
+        }
+    } else {
+        \$bits = ("1" * \$Prefix).PadRight(32, "0")
+        \$mask = ((0..3) | ForEach-Object {
+            [Convert]::ToInt32(\$bits.Substring(\$_ * 8, 8), 2)
+        }) -join "."
+        \$result = \$adapter.EnableStatic(@(\$TargetIp), @(\$mask))
+        if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+            throw "EnableStatic failed with WMI code \$((\$result.ReturnValue))"
+        }
+        if (\$Gateway) {
+            \$result = \$adapter.SetGateways(@(\$Gateway), @(1))
+            if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+                throw "SetGateways failed with WMI code \$((\$result.ReturnValue))"
+            }
+        } else {
+            \$result = \$adapter.SetGateways(\$null, \$null)
+            if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+                throw "Clear gateways failed with WMI code \$((\$result.ReturnValue))"
+            }
+        }
+        if (\$DnsText) {
+            \$dns = \$DnsText.Split(",") | Where-Object { \$_ }
+            \$result = \$adapter.SetDNSServerSearchOrder([string[]]\$dns)
+            if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+                throw "SetDNSServerSearchOrder failed with WMI code \$((\$result.ReturnValue))"
+            }
+        } else {
+            \$result = \$adapter.SetDNSServerSearchOrder(\$null)
+            if (\$result.ReturnValue -ne 0 -and \$result.ReturnValue -ne 1) {
+                throw "Clear DNS failed with WMI code \$((\$result.ReturnValue))"
+            }
+        }
+    }
+    Start-Sleep -Seconds 2
+    \$verified = Get-WmiObject Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue |
+        Where-Object {
+            \$_.MACAddress -and
+            ((\$_.MACAddress -replace "[:-]","").ToUpper() -eq \$TargetMac)
+        } | Select-Object -First 1
+    if (-not \$verified) {
+        throw "Registered physical MAC disappeared during verification"
+    }
+    if (\$NetworkMode -eq "dhcp") {
+        if (-not \$verified.DHCPEnabled) {
+            throw "DHCP verification failed after EnableDHCP"
+        }
+    } elseif (-not (\$verified.IPAddress -contains \$TargetIp)) {
+        throw "Static IPv4 verification failed after EnableStatic"
+    }
+    New-Item -ItemType Directory -Force -Path C:\\ProgramData | Out-Null
+    "name=\$env:COMPUTERNAME mode=\$NetworkMode ip=\$TargetIp/\$Prefix" |
+        Set-Content -Encoding ASCII C:\\ProgramData\\ZOSDeployIdentity.done
+    \$successMessage = if (\$NetworkMode -eq "dhcp") {
+        "ZOS IPv4 changed to DHCP automatic"
+    } else {
+        "ZOS one-time static IP completed"
+    }
+    Report-ZosResult \$true \$successMessage
+    & reg.exe delete "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" /v ZOSApplyNetwork /f 2>\$null
+    & reg.exe delete "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce" /v ZOSApplyNetwork /f 2>\$null
+    Remove-Item -Force -ErrorAction SilentlyContinue "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\ZOSApplyNetwork.cmd"
+    Write-Output ("SUCCESS ZOS IPv4 applied: mode=" + \$NetworkMode + " IP=" + \$TargetIp)
+    exit 0
+} catch {
+    Add-Content -Path \$LogFile -Value ("ERROR: " + \$_.Exception.Message)
+    Report-ZosResult \$false \$_.Exception.Message
+    exit 1
+}
+EOF
+            unix2dos "$script_dir/ZOSApplyNetwork.cmd" "$script_dir/ZOSApplyNetwork.ps1" \
+                >/dev/null 2>&1 || true
+            software_reg="/tmp/zos-early-software-${TASK_ID}.reg"
+            cat >"$software_reg" <<EOF
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run]
+"ZOSApplyNetwork"="C:\\\\Windows\\\\System32\\\\cmd.exe /c C:\\\\Windows\\\\Temp\\\\ZOSApplyNetwork.cmd"
+
+[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce]
+"ZOSApplyNetwork"="C:\\\\Windows\\\\System32\\\\cmd.exe /c C:\\\\Windows\\\\Temp\\\\ZOSApplyNetwork.cmd"
+EOF
+            reged -C -I "$software_hive" 'HKEY_LOCAL_MACHINE\SOFTWARE' "$software_reg" \
+                >/tmp/zos-early-software.log 2>&1 || true
+            software_verify="/tmp/zos-early-software-verify-${TASK_ID}.reg"
+            rm -f "$software_verify"
+            reged -x "$software_hive" 'HKEY_LOCAL_MACHINE\SOFTWARE' \
+                '\Microsoft\Windows\CurrentVersion\Run' "$software_verify" \
+                >/tmp/zos-early-software-verify.log 2>&1 || true
+            if grep -Fq '"ZOSApplyNetwork"=' "$software_verify"; then
+                startup_dir="$root/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup"
+                mkdir -p "$startup_dir"
+                cp -f "$script_dir/ZOSApplyNetwork.cmd" "$startup_dir/ZOSApplyNetwork.cmd" \
+                    >/dev/null 2>&1 || true
+                ip_staged=1
+            fi
+        fi
+    fi
+    sync
+    if [[ -n "$name" && "$network_mode" == "unchanged" ]]; then
+        IDENTITY_MESSAGE="Windows 7+ computer name ${name} written using ZOS early offline personalization"
+    elif [[ "$network_mode" == "dhcp" && "$offline_ip_written" == "1" &&
+            "$ip_staged" == "1" ]]; then
+        IDENTITY_MESSAGE="Windows name ${name:-preserved}; DHCP and automatic DNS written offline with one-time MAC verification"
+    elif [[ -n "$name" && "$network_mode" == "static" &&
+            "$offline_ip_written" == "1" && "$ip_staged" == "1" ]]; then
+        IDENTITY_MESSAGE="Windows name/IP written offline; MAC verification staged"
+    elif [[ -z "$name" && "$network_mode" == "static" &&
+            "$offline_ip_written" == "1" && "$ip_staged" == "1" ]]; then
+        IDENTITY_MESSAGE="Windows IP/DNS written offline; MAC verification staged"
+    elif [[ "$ip_staged" == "1" ]]; then
+        IDENTITY_MESSAGE="Windows ${network_mode} network action staged for MAC"
+    else
+        IDENTITY_MESSAGE="The required MAC-based static IP verification could not be staged"
+        return 1
+    fi
+    return 0
+}
+
+install_windows_identity_direct() {
+    local part="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7"
+    local network_mode="${8:-}"
+    [[ -n "$network_mode" ]] ||
+        network_mode=$([[ -n "$address" ]] && echo static || echo unchanged)
+    local direct_root="/tmp/zos-early-direct-${TASK_ID}"
+    local local_system local_software local_verify local_cmd local_ps1 startup_local
+    local verify_reg="" needs_network=0 install_rc=0 fallback_staged=0
+    local install_message=""
+
+    command -v ntfscat >/dev/null 2>&1 || {
+        IDENTITY_MESSAGE="ZOS environment has no ntfscat"
+        return 1
+    }
+    command -v ntfscp >/dev/null 2>&1 || {
+        IDENTITY_MESSAGE="ZOS environment has no ntfscp"
+        return 1
+    }
+    rm -rf "$direct_root"
+    mkdir -p \
+        "$direct_root/Windows/System32/config" \
+        "$direct_root/Windows/Temp" \
+        "$direct_root/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup"
+    local_system="$direct_root/Windows/System32/config/SYSTEM"
+    local_software="$direct_root/Windows/System32/config/SOFTWARE"
+    local_verify="$direct_root/Windows/System32/config/SYSTEM.verify"
+
+    if ! ntfscat -f "$part" /Windows/System32/config/SYSTEM \
+        >"$local_system" 2>/tmp/zos-early-direct.log; then
+        IDENTITY_MESSAGE="${part} is not the Windows 7+ system partition"
+        return 1
+    fi
+    if [[ "$network_mode" != "unchanged" ]] &&
+        ntfscat -f "$part" /Windows/System32/config/SOFTWARE \
+        >"$local_software" 2>/tmp/zos-early-direct.log; then
+        needs_network=1
+    fi
+    install_windows_identity \
+        "$direct_root" "$name" "$address" "$prefix" "$gateway" "$dns" \
+        "$target_mac" "$network_mode" ||
+        install_rc=$?
+    install_message="$IDENTITY_MESSAGE"
+    if [[ -s "$direct_root/Windows/Temp/ZOSApplyNetwork.cmd" &&
+          -s "$direct_root/Windows/Temp/ZOSApplyNetwork.ps1" ]]; then
+        fallback_staged=1
+    fi
+    if ! ntfscp -f "$part" "$local_system" /Windows/System32/config/SYSTEM \
+        >/tmp/zos-early-direct.log 2>&1; then
+        IDENTITY_MESSAGE="Cannot write modified Windows SYSTEM hive: $(tail -n 1 /tmp/zos-early-direct.log)"
+        return 1
+    fi
+    if [[ "$fallback_staged" == "1" && "$needs_network" == "1" &&
+          -s "$local_software" ]]; then
+        local_cmd="$direct_root/Windows/Temp/ZOSApplyNetwork.cmd"
+        local_ps1="$direct_root/Windows/Temp/ZOSApplyNetwork.ps1"
+        startup_local="$direct_root/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/ZOSApplyNetwork.cmd"
+        ntfscp -f "$part" "$local_cmd" /Windows/Temp/ZOSApplyNetwork.cmd \
+            >/tmp/zos-early-direct.log 2>&1 || {
+            IDENTITY_MESSAGE="Computer name written, but cannot write one-time network CMD"
+            return 1
+        }
+        ntfscp -f "$part" "$local_ps1" /Windows/Temp/ZOSApplyNetwork.ps1 \
+            >/tmp/zos-early-direct.log 2>&1 || {
+            IDENTITY_MESSAGE="Computer name written, but cannot write one-time network PowerShell"
+            return 1
+        }
+        ntfscp -f "$part" "$startup_local" \
+            "/ProgramData/Microsoft/Windows/Start Menu/Programs/Startup/ZOSApplyNetwork.cmd" \
+            >/tmp/zos-early-direct-startup.log 2>&1 || true
+        ntfscp -f "$part" "$local_software" /Windows/System32/config/SOFTWARE \
+            >/tmp/zos-early-direct.log 2>&1 || {
+            IDENTITY_MESSAGE="Computer name written, but cannot write modified SOFTWARE hive"
+            return 1
+        }
+    fi
+
+    if ! ntfscat -f "$part" /Windows/System32/config/SYSTEM \
+        >"$local_verify" 2>/tmp/zos-early-direct-verify.log; then
+        IDENTITY_MESSAGE="Cannot read back the modified Windows SYSTEM hive"
+        return 1
+    fi
+    if [[ -n "$name" ]]; then
+        verify_reg="/tmp/zos-early-direct-name-${TASK_ID}.reg"
+        rm -f "$verify_reg"
+        reged -x "$local_verify" 'HKEY_LOCAL_MACHINE\SYSTEM' \
+            '\ControlSet001\Control\ComputerName\ComputerName' "$verify_reg" \
+            >/tmp/zos-early-direct-verify.log 2>&1 || true
+        grep -Fq "\"ComputerName\"=\"${name}\"" "$verify_reg" || {
+            IDENTITY_MESSAGE="Direct NTFS read-back did not contain computer name ${name}"
+            return 1
+        }
+    fi
+    sync
+    if [[ "$network_mode" != "unchanged" ]]; then
+        if [[ "$install_rc" != "0" ]]; then
+            IDENTITY_MESSAGE="$install_message"
+            return 1
+        fi
+        if [[ "$fallback_staged" == "1" ]]; then
+            if [[ "$needs_network" != "1" || ! -s "$local_software" ]]; then
+                IDENTITY_MESSAGE="Computer name ${name} was verified offline, but the one-time static IP fallback could not be written"
+                return 1
+            fi
+            if [[ -n "$name" ]]; then
+                IDENTITY_MESSAGE="Windows 7+ computer name verified offline; one-time ${network_mode} IPv4 action written directly"
+            else
+                IDENTITY_MESSAGE="Windows computer name preserved; one-time ${network_mode} IPv4 action written directly"
+            fi
+        else
+            IDENTITY_MESSAGE="$install_message"
+        fi
+    else
+        IDENTITY_MESSAGE="Windows 7+ computer name verified using ZOS early offline personalization; network configuration preserved"
+    fi
+    return 0
+}
+
+mount_windows_partition_rw() {
+    local part="$1" mountpoint="$2" ntfs_tool=""
+    : > /tmp/zos-ntfs-mount.log
+
+    # ntfs-3g is a userspace FUSE program, not a kernel filesystem name.
+    # BusyBox mount -t ntfs-3g returns ENODEV ("No such device"), so invoke
+    # the program directly after preparing FUSE.
+    modprobe fuse >/dev/null 2>&1 || true
+    if [[ ! -c /dev/fuse ]] && command -v mknod >/dev/null 2>&1; then
+        mknod /dev/fuse c 10 229 >/dev/null 2>&1 || true
+        chmod 0666 /dev/fuse >/dev/null 2>&1 || true
+    fi
+    ntfs_tool=$(command -v ntfs-3g 2>/dev/null || true)
+    if [[ -n "$ntfs_tool" ]]; then
+        if "$ntfs_tool" -o rw "$part" "$mountpoint" \
+            >/tmp/zos-ntfs-mount.log 2>&1; then
+            return 0
+        fi
+        # A cloned Windows Fast Startup/hibernation state is stale on the new
+        # hardware. Discard it and retry so offline personalization can proceed.
+        if "$ntfs_tool" -o rw,remove_hiberfile "$part" "$mountpoint" \
+            >/tmp/zos-ntfs-mount.log 2>&1; then
+            return 0
+        fi
+    fi
+
+    # Fallback for kernels that provide the in-kernel NTFS3 driver but do not
+    # provide usable FUSE support.
+    modprobe ntfs3 >/dev/null 2>&1 || true
+    if grep -qw ntfs3 /proc/filesystems 2>/dev/null; then
+        if mount -t ntfs3 -o rw "$part" "$mountpoint" \
+            >/tmp/zos-ntfs-mount.log 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+apply_deployed_identity() {
+    local disk="$1" name="$2" address="$3" prefix="$4"
+    local gateway="$5" dns="$6" target_mac="$7"
+    local network_mode="${8:-}"
+    [[ -n "$network_mode" ]] ||
+        network_mode=$([[ -n "$address" ]] && echo static || echo unchanged)
+    local mountpoint="/mnt/zos-target" part fstype linux_root result
+    local -a mount_prefix=()
+    local last_error=""
+    IDENTITY_MESSAGE=""
+    mkdir -p "$mountpoint"
+    command -v timeout >/dev/null 2>&1 && mount_prefix=(timeout 20)
+    partprobe "$disk" >/dev/null 2>&1 || true
+    udevadm settle >/dev/null 2>&1 || true
+    modprobe dm_mod >/dev/null 2>&1 || true
+    if command -v lvm >/dev/null 2>&1; then
+        "${mount_prefix[@]}" lvm pvscan --cache >/tmp/zos-pvscan.log 2>&1 || true
+        "${mount_prefix[@]}" lvm vgscan --mknodes >/tmp/zos-vgscan.log 2>&1 || true
+    fi
+    command -v dmsetup >/dev/null 2>&1 && dmsetup mknodes >/dev/null 2>&1 || true
+    if command -v vgchange >/dev/null 2>&1; then
+        "${mount_prefix[@]}" vgchange -ay >/tmp/zos-vgchange.log 2>&1 || true
+    elif command -v lvm >/dev/null 2>&1; then
+        "${mount_prefix[@]}" lvm vgchange -ay >/tmp/zos-vgchange.log 2>&1 || true
+    fi
+    udevadm settle >/dev/null 2>&1 || true
+    # Deepin 25 Solid does not boot directly from the OSTree deployment tree.
+    # /etc, /usr and /opt are composed from persistent upper modification layers.
+    # Write identity into those active/lower upperdirs before using the generic path.
+    if apply_deepin_solid_identity         "$disk" "$name" "$address" "$prefix" "$gateway" "$dns"         "$target_mac" "$network_mode"; then
+        return 0
+    fi
+    while read -r part; do
+        [[ -b "$part" ]] || continue
+        "${mount_prefix[@]}" umount -l "$mountpoint" >/dev/null 2>&1 || true
+        fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null)
+        case "$fstype" in
+            ntfs|ntfs3)
+                if ! mount_windows_partition_rw "$part" "$mountpoint"; then
+                    if install_windows_identity_direct \
+                        "$part" "$name" "$address" "$prefix" "$gateway" "$dns" \
+                        "$target_mac" "$network_mode"; then
+                        return 0
+                    fi
+                    last_error="$IDENTITY_MESSAGE"
+                    continue
+                fi
+                if [[ -d "$mountpoint/Windows" || -d "$mountpoint/WINDOWS" ]]; then
+                    install_windows_identity \
+                        "$mountpoint" "$name" "$address" "$prefix" "$gateway" "$dns" \
+                        "$target_mac" "$network_mode"
+                    result=$?
+                    "${mount_prefix[@]}" umount -l "$mountpoint" >/dev/null 2>&1 || true
+                    return "$result"
+                fi
+                ;;
+            ext2|ext3|ext4|xfs|btrfs)
+                if [[ "$fstype" == "xfs" ]]; then
+                    "${mount_prefix[@]}" mount -t xfs -o rw,nouuid "$part" "$mountpoint" \
+                        >/tmp/zos-mount.log 2>&1 || {
+                        last_error="Cannot mount Kylin/XFS root ${part}: $(tail -n 1 /tmp/zos-mount.log)"
+                        continue
+                    }
+                else
+                    "${mount_prefix[@]}" mount -o rw "$part" "$mountpoint" \
+                        >/tmp/zos-mount.log 2>&1 || {
+                        last_error="Cannot mount Linux root candidate ${part}: $(tail -n 1 /tmp/zos-mount.log)"
+                        continue
+                    }
+                fi
+                result=1
+                local applied=0 candidate_root
+                for candidate_root in \
+                    "$mountpoint" "$mountpoint/@" "$mountpoint/rootfs" "$mountpoint/sysroot" \
+                    "$mountpoint"/ostree/deploy/*/deploy/*.0 \
+                    "$mountpoint"/sysroot/ostree/deploy/*/deploy/*.0 \
+                    "$mountpoint"/rootfs/ostree/deploy/*/deploy/*.0; do
+                    [[ -d "$candidate_root" ]] || continue
+                    if [[ -e "$candidate_root/usr/lib/os-release" ||
+                          -e "$candidate_root/etc/os-release" ||
+                          -L "$candidate_root/etc/os-release" ]]; then
+                        if install_linux_identity \
+                            "$candidate_root" "$name" "$address" "$prefix" "$gateway" "$dns" \
+                            "$target_mac" "$network_mode"; then
+                            applied=$((applied + 1))
+                            result=0
+                        else
+                            last_error="$IDENTITY_MESSAGE"
+                        fi
+                    fi
+                done
+                if (( applied > 0 )); then
+                    (( applied > 1 )) && IDENTITY_MESSAGE="Linux identity written to ${applied} OSTree deployments; ${IDENTITY_MESSAGE}"
+                    "${mount_prefix[@]}" umount -l "$mountpoint" >/dev/null 2>&1 || true
+                    return 0
+                fi
+                ;;
+        esac
+        "${mount_prefix[@]}" umount -l "$mountpoint" >/dev/null 2>&1 || true
+    done < <(lsblk -lnpo NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part" || $2=="lvm" {print $1}')
+    IDENTITY_MESSAGE="${last_error:-No supported Windows or Linux system partition was found}"
+    return 1
+}
+
+capture_main() {
+    local requested_device device image_type filesystem source_bytes source_arch
+    local header response upload_rc partclone_bin device_kind post_action
+
+    echo "[1/4] Connecting to ${SERVER}:${PORT}..."
+    claim_task capture || return 1
+    TASK_ID=$(jq -r '.task.id // empty' <<<"$CLAIM_RESPONSE")
+    [[ -n "$TASK_ID" ]] || {
+        echo "No queued upload task. Create a task on the manager first."
+        return 0
+    }
+    post_action=$(jq -r '.task.post_action // "none"' <<<"$CLAIM_RESPONSE")
+
+    device=$(jq -r '.task.device // "auto"' <<<"$CLAIM_RESPONSE")
+    image_type=$(jq -r '.task.image_type // empty' <<<"$CLAIM_RESPONSE")
+    filesystem=$(jq -r '.task.filesystem // "auto"' <<<"$CLAIM_RESPONSE")
+    requested_device="$device"
+    device=$(detect_disk "$requested_device")
+    if [[ -n "$device" && "$device" != "$requested_device" ]]; then
+        echo "Requested source ${requested_device} is unavailable; detected ${device}"
+    fi
+    [[ "$device" =~ ^/dev/[A-Za-z0-9._/+:-]+$ && "$device" != *".."* ]] || {
+        lsblk -b -o NAME,PATH,TYPE,SIZE,RO,RM,FSTYPE 2>/dev/null || true
+        report_failure "No usable source disk was detected (requested: ${requested_device})"
+        return 1
+    }
+    [[ -b "$device" ]] || {
+        report_failure "Detected source device does not exist: ${device}"
+        return 1
+    }
+    [[ "$image_type" == "raw_disk" || "$image_type" == "partclone_partition" ]] || {
+        report_failure "Unsupported image type: ${image_type}"
+        return 1
+    }
+    if [[ "$image_type" == "partclone_partition" ]]; then
+        device_kind=$(lsblk -dnpo TYPE "$device" 2>/dev/null | awk 'NR==1 {print $1}')
+        if [[ "$device_kind" == "disk" ]]; then
+            echo "Whole disk ${device} selected; switching from Partclone partition mode to RAW disk image."
+            image_type="raw_disk"
+        else
+            if [[ "$filesystem" == "auto" || -z "$filesystem" ]]; then
+                filesystem=$(blkid -o value -s TYPE "$device" 2>/dev/null)
+            fi
+            [[ "$filesystem" == "ext2" || "$filesystem" == "ext3" ]] && filesystem="ext4"
+            [[ "$filesystem" == "vfat" || "$filesystem" == "fat32" ]] && filesystem="fat"
+            partclone_bin="/usr/sbin/partclone.${filesystem}"
+            if [[ -z "$filesystem" || ! -x "$partclone_bin" ]]; then
+                echo "No matching Partclone reader for ${filesystem:-unknown}; falling back to RAW source capture."
+                image_type="raw_disk"
+            fi
+        fi
+    fi
+    source_bytes=$(blockdev --getsize64 "$device" 2>/dev/null)
+    [[ "${source_bytes:-0}" -gt 0 ]] || {
+        lsblk -b -o NAME,PATH,TYPE,SIZE,RO,RM,FSTYPE 2>/dev/null || true
+        report_failure "Cannot determine source size for ${device}"
+        return 1
+    }
+
+    echo "[2/4] Task ${TASK_ID}, source ${device}, read-only capture"
+    source_arch=$(uname -m 2>/dev/null || echo unknown)
+    header=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg mac "$MAC" \
+        --arg device "$device" --arg image_type "$image_type" --arg filesystem "$filesystem" \
+        --arg source_arch "$source_arch" \
+        --argjson source_bytes "$source_bytes" \
+        '{op:"upload",token:$token,task_id:$task_id,mac:$mac,source_bytes:$source_bytes,
+          device:$device,image_type:$image_type,filesystem:$filesystem,source_arch:$source_arch}')
+
+    echo "[3/4] Compressing and uploading through TCP..."
+    if [[ "$image_type" == "raw_disk" ]]; then
+        response=$(
+            {
+                printf '%s\n' "$header"
+                dd if="$device" bs=4M status=progress | zstd -T0 -3 -c
+            } | socat - "TCP:${SERVER}:${PORT},connect-timeout=10"
+        )
+        upload_rc=$?
+    else
+        response=$(
+            {
+                printf '%s\n' "$header"
+                "$partclone_bin" -c -s "$device" -o - | zstd -T0 -3 -c
+            } | socat - "TCP:${SERVER}:${PORT},connect-timeout=10"
+        )
+        upload_rc=$?
+    fi
+    [[ $upload_rc -eq 0 ]] || {
+        report_failure "TCP upload pipeline failed (${upload_rc})"
+        return 1
+    }
+    [[ $(jq -r '.ok // false' <<<"$response") == "true" ]] || {
+        report_failure "$(jq -r '.error // "Server did not complete image"' <<<"$response")"
+        return 1
+    }
+
+    echo "[4/4] Image upload completed"
+    echo "Stored bytes: $(jq -r '.bytes // 0' <<<"$response")"
+    echo "SHA-256:     $(jq -r '.sha256 // ""' <<<"$response")"
+    echo "------------------------------------------------------------"
+    perform_post_action "$post_action"
+}
+
+deploy_main() {
+    local requested_device device source_bytes target_bytes image_name image_type
+    local header complete response download_rc count post_action transfer_mode
+    local ready_payload status_payload multicast_state ready_count expected portbase multicast_protocol multicast_session_id
+    local request_rc=0 transport_rc=0 decoder_rc=0 writer_rc=0 written_bytes=0
+    local -a transfer_status=()
+    local multicast_profile rcvbuf identity_enabled identity_name_enabled identity_ip_enabled
+    local identity_network_mode
+    local identity_name identity_ip
+    local identity_prefix identity_gateway identity_dns identity_ok=true identity_message=""
+
+    echo "[1/5] Connecting to ${SERVER}:${PORT}..."
+    claim_task deploy || return 1
+    TASK_ID=$(jq -r '.task.id // empty' <<<"$CLAIM_RESPONSE")
+    [[ -n "$TASK_ID" ]] || {
+        echo "No queued deploy task. Create a deploy task on the manager first."
+        return 0
+    }
+    post_action=$(jq -r '.task.post_action // "none"' <<<"$CLAIM_RESPONSE")
+    transfer_mode=$(jq -r '.task.transfer_mode // "unicast"' <<<"$CLAIM_RESPONSE")
+    multicast_profile=$(jq -r '.task.multicast_profile // "gigabit"' <<<"$CLAIM_RESPONSE")
+    identity_enabled=$(jq -r '.task.apply_registered_identity // false' <<<"$CLAIM_RESPONSE")
+    identity_name_enabled=$(jq -r '(.task.apply_computer_name // .task.apply_registered_identity // false)' <<<"$CLAIM_RESPONSE")
+    identity_ip_enabled=$(jq -r '(.task.apply_static_ip // .task.apply_registered_identity // false)' <<<"$CLAIM_RESPONSE")
+    identity_network_mode=$(jq -r '
+        if .task.identity_network_mode then .task.identity_network_mode
+        elif (.task.apply_static_ip // false) then "static"
+        else "unchanged" end' <<<"$CLAIM_RESPONSE")
+    case "$identity_network_mode" in
+        static|dhcp|unchanged) ;;
+        *) identity_network_mode="unchanged" ;;
+    esac
+    identity_name=$(jq -r '.task.identity_name // empty' <<<"$CLAIM_RESPONSE")
+    identity_ip=$(jq -r '.task.identity_ip // empty' <<<"$CLAIM_RESPONSE")
+    identity_prefix=$(jq -r '.task.identity_prefix // 24' <<<"$CLAIM_RESPONSE")
+    identity_gateway=$(jq -r '.task.identity_gateway // empty' <<<"$CLAIM_RESPONSE")
+    identity_dns=$(jq -r '(.task.identity_dns // []) | join(",")' <<<"$CLAIM_RESPONSE")
+    [[ "$identity_name_enabled" == "true" ]] || identity_name=""
+    if [[ "$identity_network_mode" != "static" ]]; then
+        identity_ip=""
+        identity_gateway=""
+        identity_dns=""
+    fi
+    if [[ "$identity_name_enabled" == "true" ||
+          "$identity_network_mode" == "static" ||
+          "$identity_network_mode" == "dhcp" ]]; then
+        identity_enabled=true
+    else
+        identity_enabled=false
+    fi
+
+    requested_device=$(jq -r '.task.device // "auto"' <<<"$CLAIM_RESPONSE")
+    image_name=$(jq -r '.task.image_name // "image"' <<<"$CLAIM_RESPONSE")
+    image_type=$(jq -r '.task.image_type // empty' <<<"$CLAIM_RESPONSE")
+    source_bytes=$(jq -r '.task.source_bytes // 0' <<<"$CLAIM_RESPONSE")
+    [[ "$image_type" == "raw_disk" ]] || {
+        report_failure "Deploy supports RAW whole-disk images only"
+        return 1
+    }
+    [[ "$source_bytes" =~ ^[0-9]+$ && "$source_bytes" -gt 0 ]] || {
+        report_failure "Image source size is invalid"
+        return 1
+    }
+    [[ "$transfer_mode" == "unicast" || "$transfer_mode" == "multicast" ]] || {
+        report_failure "Unsupported deploy transfer mode: ${transfer_mode}"
+        return 1
+    }
+    if [[ "$transfer_mode" == "multicast" ]] &&        ! command -v udp-receiver >/dev/null 2>&1 &&        ! command -v zosmc-receiver >/dev/null 2>&1; then
+        report_failure "ZOS environment has no reliable multicast receiver"
+        return 1
+    fi
+    case "$multicast_profile" in
+        compatible) rcvbuf=4194304 ;;
+        maximum) rcvbuf=16777216 ;;
+        *) multicast_profile="gigabit"; rcvbuf=8388608 ;;
+    esac
+
+    device=$(detect_disk "$requested_device" "$source_bytes")
+    [[ "$device" =~ ^/dev/[A-Za-z0-9._/+:-]+$ && "$device" != *".."* && -b "$device" ]] || {
+        lsblk -b -o NAME,PATH,TYPE,SIZE,RO,RM,FSTYPE 2>/dev/null || true
+        report_failure "No usable target disk was detected (requested: ${requested_device})"
+        return 1
+    }
+    target_bytes=$(blockdev --getsize64 "$device" 2>/dev/null)
+    [[ "${target_bytes:-0}" -ge "$source_bytes" ]] || {
+        report_failure "Target ${device} is smaller than the source disk (${target_bytes:-0} < ${source_bytes})"
+        return 1
+    }
+
+    echo "[2/5] Task ${TASK_ID}, image ${image_name}"
+    echo "Target disk: ${device} (${target_bytes} bytes)"
+    echo "Transfer: $([[ "$transfer_mode" == "multicast" ]] && echo "reliable multicast" || echo "individual TCP")"
+    if [[ "$identity_enabled" == "true" ]]; then
+        [[ "$identity_name_enabled" == "true" ]] &&
+            echo "Post-deploy computer name: ${identity_name}" ||
+            echo "Post-deploy computer name: preserve image setting"
+        [[ "$identity_network_mode" == "static" ]] &&
+            echo "Post-deploy IPv4: ${identity_ip}/${identity_prefix}, gateway=${identity_gateway:-none}, DNS=${identity_dns:-none}" ||
+            {
+                [[ "$identity_network_mode" == "dhcp" ]] &&
+                    echo "Post-deploy IPv4: DHCP automatic" ||
+                    echo "Post-deploy IPv4: preserve image setting"
+            }
+    fi
+    echo "WARNING: all partitions and data on ${device} will be overwritten."
+    for count in 5 4 3 2 1; do
+        echo "Writing starts in ${count}..."
+        sleep 1
+    done
+
+    if [[ "$transfer_mode" == "multicast" ]]; then
+        echo "[3/5] Target disk is ready. Waiting for every group client..."
+        ready_payload=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg mac "$MAC" \
+            '{op:"multicast_ready",token:$token,task_id:$task_id,mac:$mac}')
+        response=$(tcp_json "$ready_payload") || {
+            report_failure "Cannot report multicast readiness"
+            return 1
+        }
+        while true; do
+            [[ $(jq -r '.ok // false' <<<"$response") == "true" ]] || {
+                report_failure "$(jq -r '.error // "Manager rejected multicast readiness"' <<<"$response")"
+                return 1
+            }
+            multicast_state=$(jq -r '.state // "waiting"' <<<"$response")
+            ready_count=$(jq -r '.ready_count // 0' <<<"$response")
+            expected=$(jq -r '.expected // 0' <<<"$response")
+            multicast_protocol=$(jq -r '.protocol // "udpcast"' <<<"$response")
+            printf '\rMulticast group ready: %s/%s; state=%s; protocol=%s   ' \
+                "$ready_count" "$expected" "$multicast_state" "$multicast_protocol"
+            if [[ "$multicast_state" == "failed" || "$multicast_state" == "cancelled" ]]; then
+                printf '\n'
+                report_failure "Multicast session ${multicast_state}"
+                return 1
+            fi
+            if [[ "$multicast_state" == "running" || "$multicast_state" == "sent" ||
+                  ( "$multicast_state" == "starting" && "$multicast_protocol" == "zosmc1" ) ]]; then
+                printf '\n'
+                portbase=$(jq -r '.portbase // 0' <<<"$response")
+                multicast_session_id=$(jq -r '.session_id // empty' <<<"$response")
+                break
+            fi
+            sleep 2
+            status_payload=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg mac "$MAC" \
+                '{op:"multicast_status",token:$token,task_id:$task_id,mac:$mac}')
+            response=$(tcp_json "$status_payload") || {
+                report_failure "Cannot query multicast session"
+                return 1
+            }
+        done
+        [[ "$portbase" =~ ^[0-9]+$ && "$portbase" -ge 1024 ]] || {
+            report_failure "Manager returned an invalid multicast port"
+            return 1
+        }
+        echo "All clients are ready. Receiving one reliable multicast stream..."
+        notify_deploy_started || {
+            report_failure "Manager rejected deploy start"
+            return 1
+        }
+        start_progress_reporter "$source_bytes"
+        if [[ "$multicast_protocol" == "zosmc1" ]]; then
+            [[ -n "$multicast_session_id" ]] || {
+                report_failure "Manager returned no ZOS multicast session id"
+                return 1
+            }
+            command -v zosmc-receiver >/dev/null 2>&1 || {
+                report_failure "ZOSMC receiver is missing from this PXE environment"
+                return 1
+            }
+            zosmc-receiver \
+                --session-id "$multicast_session_id" \
+                --server-ip "$SERVER" \
+                --interface-ip "$CLIENT_IP" \
+                --port "$portbase" \
+                --mac "$MAC" \
+                --receive-timeout 180 |
+                zstd -d -c |
+                dd of="$device" bs=8M conv=fsync status=progress \
+                    2>"$PROGRESS_STATUS_FILE"
+        else
+            udp-receiver \
+                --interface "$CLIENT_IFACE" \
+                --mcast-rdv-address "$SERVER" \
+                --portbase "$portbase" \
+                --rcvbuf "$rcvbuf" \
+                --nokbd \
+                --start-timeout 900 \
+                --receive-timeout 120 |
+                zstd -d -c |
+                dd of="$device" bs=8M conv=fsync status=progress \
+                    2>"$PROGRESS_STATUS_FILE"
+        fi
+        transfer_status=("${PIPESTATUS[@]}")
+        request_rc=0
+        transport_rc=${transfer_status[0]:-255}
+        decoder_rc=${transfer_status[1]:-255}
+        writer_rc=${transfer_status[2]:-255}
+    else
+        header=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg mac "$MAC" \
+            '{op:"download",token:$token,task_id:$task_id,mac:$mac}')
+        echo "[3/5] Downloading, decompressing and writing the disk..."
+        notify_deploy_started || {
+            report_failure "Manager rejected deploy start"
+            return 1
+        }
+        start_progress_reporter "$source_bytes"
+        printf '%s\n' "$header" |
+            socat "STDIO,ignoreeof" "TCP:${SERVER}:${PORT},connect-timeout=10" |
+            zstd -d -c |
+            dd of="$device" bs=8M conv=fsync status=progress \
+                2>"$PROGRESS_STATUS_FILE"
+        transfer_status=("${PIPESTATUS[@]}")
+        request_rc=${transfer_status[0]:-255}
+        transport_rc=${transfer_status[1]:-255}
+        decoder_rc=${transfer_status[2]:-255}
+        writer_rc=${transfer_status[3]:-255}
+    fi
+
+    # dd wrote progress to a regular file, so parsing cannot break the data pipe.
+    sleep 1
+    refresh_written_progress
+    written_bytes=$(read_written_progress)
+    if deploy_pipeline_complete \
+        "$source_bytes" "$written_bytes" "$request_rc" \
+        "$transport_rc" "$decoder_rc" "$writer_rc"; then
+        download_rc=0
+    else
+        download_rc=1
+    fi
+
+    # End the single-line progress display before printing any normal log line.
+    [[ $download_rc -eq 0 ]] && stop_progress_reporter 1 "$source_bytes" ||
+        stop_progress_reporter 0 "$source_bytes"
+    if [[ $download_rc -eq 0 && "$transport_rc" -eq 141 ]]; then
+        echo "NOTICE: transport closed with SIGPIPE after the complete zstd frame was written."
+        echo "        Exact disk bytes were verified; continuing as a successful deployment."
+    fi
+    echo "Transfer req=${request_rc} net=${transport_rc} zstd=${decoder_rc} dd=${writer_rc} bytes=${written_bytes}/${source_bytes}"
+    [[ $download_rc -eq 0 ]] || {
+        report_failure "Write failed req=${request_rc} net=${transport_rc} zstd=${decoder_rc} dd=${writer_rc} bytes=${written_bytes}/${source_bytes}"
+        return 1
+    }
+
+    echo "[4/5] Flushing disk data..."
+    sync
+    blockdev --rereadpt "$device" >/dev/null 2>&1 || true
+    if [[ "$identity_enabled" == "true" ]]; then
+        echo "Applying selected post-deploy computer name/network options..."
+        if apply_deployed_identity \
+            "$device" "$identity_name" "$identity_ip" "$identity_prefix" \
+            "$identity_gateway" "$identity_dns" "$MAC" "$identity_network_mode"; then
+            identity_ok=true
+            identity_message="$IDENTITY_MESSAGE"
+            echo "Identity configuration scheduled: ${identity_message}"
+        else
+            identity_ok=false
+            identity_message="$IDENTITY_MESSAGE"
+            echo "WARNING: image writing succeeded, but identity configuration failed: ${identity_message}"
+        fi
+    fi
+    complete=$(jq -nc --arg token "$TOKEN" --arg task_id "$TASK_ID" --arg mac "$MAC" \
+        --argjson identity_ok "$identity_ok" --arg identity_message "$identity_message" \
+        '{op:"complete",token:$token,task_id:$task_id,mac:$mac,
+          identity_ok:$identity_ok,identity_message:$identity_message}')
+    response=$(tcp_json "$complete") || {
+        report_failure "Disk was written, but completion could not be reported"
+        return 1
+    }
+    [[ $(jq -r '.ok // false' <<<"$response") == "true" ]] || {
+        report_failure "$(jq -r '.error // "Manager rejected completion"' <<<"$response")"
+        return 1
+    }
+    echo "[5/5] Image deployment completed"
+    echo "You may reboot and boot from the local disk."
+    echo "------------------------------------------------------------"
+    perform_post_action "$post_action"
+}
+
+if [[ "${ZOS_AGENT_LIBRARY_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+banner
+validate_common || exit 1
+case "$MODE" in
+    register) register_main ;;
+    capture) capture_main ;;
+    deploy) deploy_main ;;
+    *) echo "No Jingyun imaging mode requested." ;;
+esac
+exit $?

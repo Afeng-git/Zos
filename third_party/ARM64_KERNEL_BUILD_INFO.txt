@@ -1,0 +1,22 @@
+ZOS ARM64 maintenance kernel build information
+
+Version: Linux 6.18.38
+Source archive SHA-256: ac26e508abd56e9f8b89872b6e10c49fc823bcc70d8068a5d8504c1a7c4ff045
+Kernel Image SHA-256: 08057c9868eaea3cefe4d9c2c311af4bbabb9237cbd69ad69d04928437189d65
+Architecture: arm64 / AArch64
+Compiler: Clang/LLD 17
+Kernel image: tftp/arm64/zos/Image
+Exact configuration: tftp/arm64/zos/Image.config
+Initramfs: tftp/arm64/zos/init.cpio.gz (FOG FOS/Buildroot with ZOS agent)
+
+Purpose:
+- Generic UEFI/ACPI ARM64 maintenance boot
+- Proxmox/QEMU virt
+- VirtIO PCI/MMIO network, block, SCSI and GPU
+- PL011 and 8250 serial consoles
+- EFI framebuffer/simpledrm/noVNC console
+- gzip, XZ and Zstandard initramfs decoding
+
+The x86_64 and LoongArch64 maintenance assets were not replaced by this ARM64 kernel build.
+
+Build note: all required maintenance drivers are built into the kernel; CONFIG_MODULES is disabled.

@@ -1,0 +1,17 @@
+[Unit]
+Description=Jingyun ZOS LoongArch64 maintenance agent
+After=basic.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/sbin/jingyun-zos-agent.py
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/console
+TTYReset=yes
+TTYVHangup=yes
+
+[Install]
+WantedBy=zos.target

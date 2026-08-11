@@ -1,0 +1,43 @@
+ZOS 0.21.15 多架构启动文件来源
+================================
+
+ARM64维护环境
+-------------
+内核源码：Linux 6.18.38源码包
+内核成品：tftp/arm64/zos/Image
+SHA-256：08057c9868eaea3cefe4d9c2c311af4bbabb9237cbd69ad69d04928437189d65
+精确配置：tftp/arm64/zos/Image.config
+编译器：Clang/LLD 17，目标架构AArch64
+说明：该内核以原FOG ARM64配置为基础重新编译，静态内置ACPI、EFI Stub、PL011、
+通用PCI Host、VirtIO PCI/MMIO、VirtIO网卡/块设备/SCSI/GPU、simpledrm、
+EFI framebuffer以及gzip/XZ/Zstd initramfs解压支持。未使用银河麒麟授权内核。
+
+根文件系统来源：FOGProject/fos ARM64 Buildroot/FOS initramfs
+上游输入：arm_init.cpio.gz
+上游输入SHA-256：716be054f9406c43fc304c7d2b12eaccca599e9d93e24d1b2156f57f00160e70
+包内成品：tftp/arm64/zos/init.cpio.gz
+包内成品SHA-256：e14a61866dcc817357f4d649ce684df6752a44a29d27f51edf644207ee6bbcc6
+说明：包内init.cpio.gz已替换网络启动脚本并嵌入ZOS注册、上传、下发、组播和个性化代理，
+因此成品哈希与上游输入不同。FOG FOS许可证以其项目发布内容为准。
+
+龙芯LoongArch64维护环境
+-----------------------
+来源：openEuler 24.03 LTS OS loongarch64官方PXE目录
+目录：https://repo.openeuler.org/openEuler-24.03-LTS/OS/loongarch64/images/pxeboot/
+内核：vmlinuz
+SHA-256：60dd7631d5d8f8251c704d60122cb83e3937db50bdc359011de64cb3a0296b9a
+上游initrd：initrd.img
+SHA-256：02d56564efe98d0ee666ef5dc23e6adf92a470da7eab4834ea9b47465c59bdc4
+包内成品：tftp/loongarch64/zos/initrd.xz
+包内成品SHA-256：9b2f671a4a6a4605f7f49188dbcc732b72f9860c63dd110a803242ce3517da3e
+说明：包内initrd.xz是在该上游安装环境中加入ZOS Python代理和专用systemd target后重新生成，
+因此成品哈希与上游initrd不同。openEuler软件包许可证以发行版相应源码包为准。
+
+iPXE架构识别
+------------
+DHCP体系结构值采用iPXE头文件定义：ARM64=0x000b、LoongArch32=0x0025、
+LoongArch64=0x0027。第二阶段使用iPXE buildarch值arm64和loong64选择维护文件。
+文档：https://ipxe.org/cfg/buildarch
+源码：https://github.com/ipxe/ipxe/blob/master/src/include/ipxe/dhcp.h
+
+本文件记录当前ARM64内核、ARM64根文件系统和龙芯启动资产的来源与校验值。

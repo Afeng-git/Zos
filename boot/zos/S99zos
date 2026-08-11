@@ -1,0 +1,85 @@
+#!/bin/bash
+
+set +e
+
+read_zos_cmdline() {
+    local token key value
+    for token in $(cat /proc/cmdline 2>/dev/null); do
+        case "$token" in
+            jy_mode=*|jy_server=*|jy_port=*|jy_token=*|jy_auto=*|mac=*|jy_client_ip=*|jy_netmask=*|jy_gateway=*|jy_dns=*)
+                key=${token%%=*}
+                value=${token#*=}
+                export "$key=$value"
+                ;;
+        esac
+    done
+}
+
+network_state_ready() {
+    local a b c d octet
+    [[ -f /run/zos-network.env ]] || return 1
+    # shellcheck disable=SC1091
+    source /run/zos-network.env 2>/dev/null || return 1
+    [[ -n "${ZOS_IFACE:-}" && -e "/sys/class/net/${ZOS_IFACE}" ]] || return 1
+    IFS=. read -r a b c d <<<"${ZOS_IPV4:-}"
+    [[ -n "$a" && -n "$b" && -n "$c" && -n "$d" ]] || return 1
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || return 1
+        (( octet >= 0 && octet <= 255 )) || return 1
+    done
+    return 0
+}
+
+read_zos_cmdline
+
+[[ ! -h /dev/fd ]] && ln -s /proc/self/fd /dev/fd
+[[ ! -h /dev/stdin ]] && ln -s /proc/self/fd/0 /dev/stdin
+[[ ! -h /dev/stdout ]] && ln -s /proc/self/fd/1 /dev/stdout
+[[ ! -h /dev/stderr ]] && ln -s /proc/self/fd/2 /dev/stderr
+
+# Some dependency-free initramfs rebuilders historically flattened hard links
+# into zero-byte executables. Repair the known FOS command aliases defensively.
+if [[ -f /usr/bin/gawk && ! -s /usr/bin/gawk && -x /usr/bin/gawk-5.3.2 ]]; then
+    rm -f /usr/bin/gawk
+    ln -s gawk-5.3.2 /usr/bin/gawk
+fi
+if [[ -f /bin/gunzip && ! -s /bin/gunzip && -x /bin/gzip ]]; then
+    rm -f /bin/gunzip
+    ln -s gzip /bin/gunzip
+fi
+
+if [[ ${mdraid:-false} == true ]]; then
+    mdadm --auto-detect 2>/dev/null || true
+    mdadm --assemble --scan 2>/dev/null || true
+    mdadm --incremental --run --scan 2>/dev/null || true
+fi
+[[ -n ${keymap:-} ]] && loadkeys "$keymap" 2>/dev/null || true
+
+printf '\nZOS startup: mode=%s, server=%s:%s\n' \
+    "${jy_mode:-maintenance}" "${jy_server:-unset}" "${jy_port:-8090}"
+
+case "${jy_mode:-}" in
+    capture|deploy|register)
+        # S40network records the address that it actually applied. Do not use
+        # BusyBox "ip -o" as a gate and do not restart networking when the
+        # recorded iPXE hand-off is already valid.
+        if ! network_state_ready; then
+            echo "ZOS network state is not ready; running network initialization once..."
+            /etc/init.d/S40network start || true
+        fi
+        /usr/sbin/jingyun-zos-agent
+        result=$?
+        echo
+        if [[ $result -eq 0 ]]; then
+            echo "Jingyun imaging agent finished."
+        else
+            echo "Jingyun imaging agent stopped with an error (exit $result)."
+        fi
+        echo "A ZOS diagnostic shell is now available. Type reboot to restart."
+        exec /bin/bash
+        ;;
+    *)
+        echo "ZOS maintenance shell"
+        exec /bin/bash
+        ;;
+esac

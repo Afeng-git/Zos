@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-x" ]]; then
+    key="${4:-}"
+    output="${5:-}"
+    case "$key" in
+        "\\Select")
+            printf '%s\n' \
+                'Windows Registry Editor Version 5.00' \
+                '"Current"=dword:00000001' \
+                '"Default"=dword:00000001' >"$output"
+            ;;
+        *"\\Services\\Tcpip\\Parameters\\Interfaces")
+            printf '%s\n' \
+                'Windows Registry Editor Version 5.00' \
+                '[HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001\Services\Tcpip\Parameters\Interfaces\{11111111-2222-3333-4444-555555555555}]' \
+                '"EnableDHCP"=dword:00000001' \
+                '"DhcpIPAddress"="192.168.5.102"' \
+                '"DhcpServer"="192.168.5.1"' \
+                '"LeaseObtainedTime"=dword:11111111' >"$output"
+            ;;
+        *"\\Services\\Tcpip\\Parameters\\Interfaces\\{"*)
+            mode=00000000
+            [[ -f /tmp/zos-test-network-mode ]] &&
+                mode=$(cat /tmp/zos-test-network-mode)
+            printf '%s\n' \
+                'Windows Registry Editor Version 5.00' \
+                "\"EnableDHCP\"=dword:${mode}" \
+                '"IPAddress"=hex(7):31,00,39,00,32,00,2e,00,31,00,36,00,38,00,2e,00,35,00,2e,00,31,00,30,00,31,00,00,00,00,00' >"$output"
+            ;;
+        *"\\Control\\ComputerName\\ComputerName")
+            printf '%s\n' \
+                'Windows Registry Editor Version 5.00' \
+                '"ComputerName"="balabala1"' >"$output"
+            ;;
+        "\\Microsoft\\Windows\\CurrentVersion\\Run")
+            printf '%s\n' \
+                'Windows Registry Editor Version 5.00' \
+                '"ZOSApplyNetwork"="C:\\Windows\\System32\\cmd.exe /c C:\\Windows\\Temp\\ZOSApplyNetwork.cmd"' >"$output"
+            ;;
+        *)
+            printf '%s\n' 'Windows Registry Editor Version 5.00' >"$output"
+            ;;
+    esac
+    exit 0
+fi
+
+if [[ "${1:-}" == "-C" && "${2:-}" == "-I" ]]; then
+    import_file="${5:-}"
+    if grep -q '"EnableDHCP"=dword:00000000' "$import_file"; then
+        cp -f "$import_file" /tmp/zos-test-static-import.reg
+        printf '%s' 00000000 >/tmp/zos-test-network-mode
+    elif grep -q '"EnableDHCP"=dword:00000001' "$import_file"; then
+        cp -f "$import_file" /tmp/zos-test-dhcp-import.reg
+        printf '%s' 00000001 >/tmp/zos-test-network-mode
+    fi
+    if grep -q '"ZOSApplyNetwork"=' "$import_file"; then
+        cp -f "$import_file" /tmp/zos-test-software-import.reg
+    fi
+    # Reproduce the affected reged build: it commits the import and prints OK
+    # but exits non-zero.
+    exit 1
+fi
+
+exit 1

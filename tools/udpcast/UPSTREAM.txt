@@ -1,0 +1,22 @@
+UDPcast
+=======
+
+Purpose:
+  Reliable multicast image distribution used by ZOS group deployment.
+
+Upstream:
+  https://www.udpcast.linux.lu/
+
+Source used for the bundled binaries:
+  https://github.com/a1ive/udpcast
+
+Bundled files:
+  windows-x64/udp-sender.exe
+  linux-x86_64/udp-sender
+  linux-aarch64/ (native package fallback/auto-install)
+  linux-loongarch64/ (native package fallback/auto-install)
+  ../../third_party/udpcast-msvc-source.zip
+
+License:
+  GNU GPL v2 or later, with additional component licenses described by the
+  upstream source. See COPYING and the complete bundled source archive.

@@ -137,13 +137,13 @@ def send_file(
                 raise MulticastError("multicast session was cancelled")
             if time.monotonic() >= deadline:
                 missing = len(expected - connected)
-                raise MulticastError(f"timed out waiting for {missing} LoongArch64 receivers")
+                raise MulticastError(f"timed out waiting for {missing} ZOS multicast receivers")
             data_socket.sendto(beacon, destination)
             response = receive_response(time.monotonic() + 0.5)
             if response and response[0] == HELLO and response[4][:6] in expected:
                 connected.add(response[4][:6])
             if state_callback:
-                state_callback(f"龙芯接收器握手 {len(connected)}/{len(expected)}")
+                state_callback(f"ZOS接收器握手 {len(connected)}/{len(expected)}")
 
         if state_callback:
             state_callback("all_receivers_connected")

@@ -35,7 +35,7 @@ from server.pxe_services import PxeController
 from zos_multicast import group_for_session, send_file as send_zos_multicast
 
 
-VERSION = "0.21.1"
+VERSION = "0.22.6"
 ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "manager_config.json"
 DATA_DIR = ROOT / "data"
@@ -43,6 +43,30 @@ IMAGE_DIR = ROOT / "images"
 TASK_FILE = DATA_DIR / "tasks.json"
 NODE_FILE = DATA_DIR / "nodes.json"
 REGISTRATION_FILE = DATA_DIR / "registrations.json"
+IMAGE_CATALOG_FILE = DATA_DIR / "image_catalog.json"
+
+
+def rebuild_image_catalog() -> list[dict]:
+    """Build a lightweight metadata catalog without changing image payloads."""
+    catalog = []
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    for image in sorted(IMAGE_DIR.glob("*.img.zst"), key=lambda p: p.stat().st_mtime, reverse=True):
+        sidecar = read_json(image.with_suffix(image.suffix + ".json"), {})
+        row = {
+            "file": image.name,
+            "name": str(sidecar.get("image_name") or image.name[:-8]),
+            "architecture": normalize_architecture(str(sidecar.get("source_arch") or "unknown")),
+            "image_type": str(sidecar.get("image_type") or "unknown"),
+            "source_bytes": int(sidecar.get("source_bytes") or 0),
+            "compressed_bytes": image.stat().st_size,
+            "created_at": str(sidecar.get("created_at") or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(image.stat().st_mtime))),
+            "sha256": str(sidecar.get("sha256") or ""),
+            "tags": list(sidecar.get("tags") or []),
+            "note": str(sidecar.get("note") or ""),
+        }
+        catalog.append(row)
+    atomic_json(IMAGE_CATALOG_FILE, catalog)
+    return catalog
 
 
 def normalize_architecture(value: str) -> str:
@@ -56,9 +80,48 @@ def normalize_architecture(value: str) -> str:
     return "unknown"
 
 
+def format_bytes_gib(value) -> str:
+    try:
+        size = int(value or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0:
+        return "未知"
+    gib = size / (1024 ** 3)
+    if gib >= 1024:
+        return f"{gib / 1024:.1f} TiB"
+    return f"{gib:.1f} GiB"
+
+
+def client_hardware_info(registration: dict) -> dict:
+    inventory = dict((registration or {}).get("inventory") or {})
+    analysis = (registration or {}).get("disk_analysis") or analyze_disk_inventory(inventory)
+    disks = list(analysis.get("disks") or [])
+    largest = max((int(item.get("size") or 0) for item in disks), default=0)
+    total = sum(int(item.get("size") or 0) for item in disks)
+    return {
+        "arch": normalize_architecture(str(inventory.get("arch") or "")),
+        "cpu_model": str(inventory.get("cpu_model") or "").strip() or "未知",
+        "cpu_cores": int(inventory.get("cpu_cores") or 0),
+        "memory_bytes": int(inventory.get("memory_bytes") or 0),
+        "disk_count": int(analysis.get("count") or len(disks)),
+        "largest_disk_bytes": largest,
+        "disk_total_bytes": total,
+    }
+
+
+def architecture_warning(image_arch: str, registration: dict) -> str:
+    source_arch = normalize_architecture(str(image_arch or ""))
+    target_arch = client_hardware_info(registration).get("arch", "unknown")
+    if source_arch != "unknown" and target_arch != "unknown" and source_arch != target_arch:
+        return f"CPU架构不匹配：镜像 {source_arch}，客户端 {target_arch}"
+    return ""
+
+
 def ipxe_architecture_setup() -> str:
     """Return iPXE labels that select only native maintenance assets."""
     return """set zos_arch unsupported
+set zos_netargs
 goto arch_${buildarch} || goto arch_unsupported
 
 :arch_i386
@@ -79,7 +142,8 @@ goto arch_ready
 set zos_arch arm64
 set zos_kernel Image
 set zos_init init.cpio.gz
-set zos_args loglevel=4 init=/init rw consoleblank=0 hostname=zosclient.localdomain
+set zos_args loglevel=4 rdinit=/init init=/init rw consoleblank=0 hostname=zosclient.localdomain initrd=${zos_init} earlycon keep_bootcon console=ttyAMA0,115200n8 console=ttyS0,115200n8 console=tty0
+set zos_netargs jy_client_ip=${net0/ip} jy_netmask=${net0/netmask} jy_gateway=${net0/gateway} jy_dns=${dns}
 goto arch_ready
 
 :arch_loong64
@@ -112,6 +176,64 @@ def read_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return default
+
+
+def natural_sort_key(value) -> tuple:
+    """Return a stable natural-order key, so PC-2 sorts before PC-10."""
+    parts = re.split(r"(\d+)", str(value or "").casefold())
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part)
+        for part in parts if part != ""
+    )
+
+
+def client_table_sort_key(column: int, value):
+    """Return a type-safe sort key for a registered-client table column."""
+    if column == 0:
+        return 0 if str(value) == "在线" else 1
+    if column == 1:
+        return natural_sort_key(value)
+    if column == 2:
+        try:
+            return int(ipaddress.IPv4Address(str(value).strip()))
+        except ipaddress.AddressValueError:
+            return -1
+    if column in {7, 10}:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return -1
+    if column in {8, 9}:
+        text = str(value or "").strip()
+        match = re.match(r"^([0-9.]+)\s+(GiB|TiB)$", text)
+        if match:
+            amount = float(match.group(1))
+            return amount * (1024 if match.group(2) == "TiB" else 1)
+        return -1.0
+    if column == 12:
+        return str(value or "")
+    return natural_sort_key(value)
+
+
+def clients_in_batch_direction(clients: list[dict], direction: str) -> list[dict]:
+    """Keep current visible list order, or reverse it for sequential assignment."""
+    ordered = [dict(row) for row in clients]
+    if str(direction or "forward").lower() == "reverse":
+        ordered.reverse()
+    return ordered
+
+
+class SortableTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem with an explicit numeric/natural comparison key."""
+
+    def __init__(self, value, sort_value=None):
+        super().__init__(str(value))
+        self.sort_value = sort_value if sort_value is not None else natural_sort_key(value)
+
+    def __lt__(self, other):
+        if isinstance(other, SortableTableWidgetItem):
+            return self.sort_value < other.sort_value
+        return super().__lt__(other)
 
 
 def safe_name(value: str) -> str:
@@ -374,7 +496,7 @@ def parse_client_import(path: Path) -> tuple[list[dict], list[str]]:
     aliases = {
         "mac": {"mac", "mac地址", "物理地址", "网卡地址"},
         "name": {"客户端名称", "计算机名", "电脑名称", "名称", "name", "hostname"},
-        "ip": {"ip", "ip地址", "ipv4", "ipv4地址", "address"},
+        "ip": {"ip", "ip地址", "注册ip", "注册ip地址", "ipv4", "ipv4地址", "address"},
         "group": {"组", "分组", "客户端分组", "group"},
     }
 
@@ -495,6 +617,7 @@ def default_config() -> dict:
         "tftp_port": 69,
         "tcp_port": 8090,
         "multicast_start_timeout": 900,
+        "zosmc_handshake_timeout": 60,
         "local_boot_timeout": 10,
         "client_groups": ["默认组"],
         "agent_token": secrets.token_urlsafe(24),
@@ -518,36 +641,90 @@ class JsonTaskStore:
         with self.lock:
             return read_json(REGISTRATION_FILE, [])
 
+    def _sync_pending_task_identity(self, updates_by_mac: dict[str, dict]) -> None:
+        """Keep queued MAC-targeted tasks aligned with the registered identity."""
+        if not updates_by_mac:
+            return
+        tasks = self.tasks()
+        changed = False
+        for task in tasks:
+            mac = str(task.get("target_mac") or "").lower()
+            identity = updates_by_mac.get(mac)
+            if not identity or task.get("status") not in {"queued", "failed"}:
+                continue
+            name = str(identity.get("name") or "未命名客户端")[:80]
+            ip = str(identity.get("ip") or "")[:45]
+            task["registered_name"] = name
+            task["registered_ip"] = ip
+            task["hostname"] = name
+            task["client_ip"] = ip
+            if task.get("action") == "deploy":
+                if bool(task.get("apply_computer_name")):
+                    task["identity_name"] = safe_computer_name(name, mac)
+                if bool(task.get("apply_static_ip")):
+                    task["identity_ip"] = ip
+            changed = True
+        if changed:
+            self._save_tasks(tasks)
+
     def register_client(self, request: dict) -> dict:
         mac = normalize_mac(str(request.get("mac", "")))
         hostname = str(request.get("hostname") or "zosclient")[:80]
-        name = str(request.get("name") or hostname).strip()[:80] or hostname
-        group = normalize_group_name(str(request.get("group") or "默认组"))
-        ip = str(request.get("ip") or "")[:45]
+        requested_name = str(request.get("name") or hostname).strip()[:80] or hostname
+        requested_group = normalize_group_name(str(request.get("group") or "默认组"))
+        reported_ip = str(request.get("ip") or "")[:45]
         inventory = request.get("inventory", {})
-        row = {
-            "mac": mac,
-            "name": name,
-            "hostname": hostname,
-            "group": group,
-            "ip": ip,
-            "inventory": inventory,
-            "disk_analysis": analyze_disk_inventory(inventory),
-            "registered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "last_seen": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
         with self.lock:
-            rows = [item for item in self.registrations() if item.get("mac") != mac]
+            rows = self.registrations()
+            existing = next((item for item in rows if item.get("mac") == mac), {})
+            if existing:
+                # Once a MAC is registered, the management record is authoritative.
+                # PXE boots only refresh live status; administrators edit identity in the UI.
+                configured_name = str(existing.get("name") or requested_name)[:80]
+                configured_group = normalize_group_name(
+                    str(existing.get("group") or requested_group)
+                )
+                configured_ip = str(existing.get("ip") or "")[:45]
+            else:
+                configured_name = requested_name
+                configured_group = requested_group
+                configured_ip = reported_ip
+            row = dict(existing)
+            row.update({
+                "mac": mac,
+                "name": configured_name,
+                "hostname": hostname,
+                "group": configured_group,
+                "ip": configured_ip,
+                "reported_ip": reported_ip,
+                "inventory": inventory,
+                "disk_analysis": analyze_disk_inventory(inventory),
+                "registered_at": existing.get("registered_at") or now,
+                "last_seen": now,
+            })
+            rows = [item for item in rows if item.get("mac") != mac]
             rows.append(row)
             atomic_json(REGISTRATION_FILE, rows)
+
+            node = dict(row)
+            node.update({
+                "hostname": hostname,
+                "ip": reported_ip,
+                "configured_name": configured_name,
+                "configured_ip": configured_ip,
+                "last_seen": now,
+            })
             nodes = [item for item in read_json(NODE_FILE, []) if item.get("mac") != mac]
-            nodes.append(dict(row))
+            nodes.append(node)
             atomic_json(NODE_FILE, nodes)
+            self._sync_pending_task_identity({mac: row})
         return row
 
     def save_registration(self, mac: str, name: str, group: str = "默认组") -> dict:
         mac = normalize_mac(mac)
         group = normalize_group_name(group)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
         with self.lock:
             rows = self.registrations()
             existing = next((item for item in rows if item.get("mac") == mac), {})
@@ -556,13 +733,113 @@ class JsonTaskStore:
                 "mac": mac,
                 "name": (name.strip() or existing.get("hostname") or "未命名客户端")[:80],
                 "group": group,
-                "registered_at": existing.get("registered_at") or time.strftime("%Y-%m-%d %H:%M:%S"),
+                "ip": str(existing.get("ip") or "")[:45],
+                "identity_locked": True,
+                "identity_updated_at": now,
+                "registered_at": existing.get("registered_at") or now,
                 "last_seen": existing.get("last_seen", ""),
             })
             rows = [item for item in rows if item.get("mac") != mac]
             rows.append(row)
             atomic_json(REGISTRATION_FILE, rows)
+            nodes = read_json(NODE_FILE, [])
+            for node in nodes:
+                if str(node.get("mac") or "").lower() == mac:
+                    node["name"] = row["name"]
+                    node["group"] = row["group"]
+                    node["configured_name"] = row["name"]
+                    node["configured_ip"] = row["ip"]
+            atomic_json(NODE_FILE, nodes)
+            self._sync_pending_task_identity({mac: row})
             return row
+
+    def update_registration_identities(self, updates: list[dict]) -> int:
+        """Update one or many registered client names/IPs and queued task snapshots."""
+        if not updates:
+            return 0
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        with self.lock:
+            rows = self.registrations()
+            by_mac = {
+                str(item.get("mac") or "").lower(): dict(item)
+                for item in rows if item.get("mac")
+            }
+            normalized: dict[str, dict] = {}
+            for source in updates:
+                mac = normalize_mac(str(source.get("mac") or ""))
+                if mac not in by_mac:
+                    raise ValueError(f"客户端未注册：{mac}")
+                existing = by_mac[mac]
+                name = str(source.get("name", existing.get("name") or "")).strip()[:80]
+                if not name:
+                    raise ValueError(f"客户端 {mac} 的计算机名不能为空")
+                raw_ip = str(source.get("ip", existing.get("ip") or "")).strip()
+                address = str(ipaddress.IPv4Address(raw_ip)) if raw_ip else ""
+                normalized[mac] = {"mac": mac, "name": name, "ip": address}
+
+            task_rows = self.tasks()
+            active_by_mac = {
+                str(task.get("target_mac") or task.get("mac") or "").lower()
+                for task in task_rows
+                if task.get("status") in {"assigned", "ready", "uploading", "deploying"}
+            }
+            active_selected = [mac for mac in normalized if mac in active_by_mac]
+            if active_selected:
+                names = "、".join(normalized[mac]["name"] for mac in active_selected[:5])
+                raise ValueError(
+                    f"客户端正在执行或已经领取任务，暂不能修改身份信息：{names}"
+                )
+            pending_static = {
+                str(task.get("target_mac") or "").lower()
+                for task in task_rows
+                if task.get("status") in {"queued", "failed"}
+                and task.get("action") == "deploy"
+                and bool(task.get("apply_static_ip"))
+            }
+            for mac, update in normalized.items():
+                if mac in pending_static and not update["ip"]:
+                    raise ValueError(
+                        f"客户端 {update['name']} 有待执行的固定IP下发任务，"
+                        "请先填写IP或取消该任务后再清空IP"
+                    )
+
+            changed_ip_macs = {
+                mac for mac, update in normalized.items()
+                if update["ip"] != str(by_mac[mac].get("ip") or "")
+            }
+            final_ip_owners: dict[str, list[str]] = {}
+            for mac, row in by_mac.items():
+                value = normalized.get(mac, {}).get("ip", str(row.get("ip") or ""))
+                if value:
+                    final_ip_owners.setdefault(value, []).append(mac)
+            for value, owners in final_ip_owners.items():
+                if len(owners) > 1 and any(mac in changed_ip_macs for mac in owners):
+                    raise ValueError(
+                        f"IP地址重复：{value} 同时分配给 {'、'.join(owners[:4])}"
+                    )
+
+            for mac, update in normalized.items():
+                row = by_mac[mac]
+                row.update({
+                    "name": update["name"],
+                    "ip": update["ip"],
+                    "identity_locked": True,
+                    "identity_updated_at": now,
+                })
+                by_mac[mac] = row
+            ordered = [by_mac[str(row.get("mac") or "").lower()] for row in rows]
+            atomic_json(REGISTRATION_FILE, ordered)
+
+            nodes = read_json(NODE_FILE, [])
+            for node in nodes:
+                mac = str(node.get("mac") or "").lower()
+                if mac in normalized:
+                    node["name"] = normalized[mac]["name"]
+                    node["configured_name"] = normalized[mac]["name"]
+                    node["configured_ip"] = normalized[mac]["ip"]
+            atomic_json(NODE_FILE, nodes)
+            self._sync_pending_task_identity({mac: by_mac[mac] for mac in normalized})
+            return len(normalized)
 
     def import_registrations(self, imported: list[dict]) -> tuple[int, int]:
         created = 0
@@ -576,6 +853,7 @@ class JsonTaskStore:
                 str(item.get("mac") or "").lower(): dict(item)
                 for item in nodes if item.get("mac")
             }
+            changed: dict[str, dict] = {}
             for source in imported:
                 mac = normalize_mac(str(source.get("mac") or ""))
                 existing = by_mac.get(mac, {})
@@ -587,18 +865,23 @@ class JsonTaskStore:
                     "name": str(source.get("name") or existing.get("name") or f"ZOS-{mac[-8:].replace(':', '')}")[:80],
                     "ip": str(source.get("ip") or "")[:45],
                     "group": normalize_group_name(str(source.get("group") or "默认组")),
+                    "identity_locked": True,
+                    "identity_updated_at": now,
                     "registered_at": existing.get("registered_at") or now,
                     "last_seen": existing.get("last_seen", ""),
                     "imported_at": now,
                 })
                 by_mac[mac] = row
+                changed[mac] = row
                 if mac in node_by_mac:
                     node_by_mac[mac].update({
-                        "hostname": row["name"], "ip": row["ip"], "group": row["group"],
+                        "name": row["name"], "group": row["group"],
+                        "configured_name": row["name"], "configured_ip": row["ip"],
                     })
             atomic_json(REGISTRATION_FILE, list(by_mac.values()))
             if nodes:
                 atomic_json(NODE_FILE, list(node_by_mac.values()))
+            self._sync_pending_task_identity(changed)
         return created, updated
 
     def delete_registrations(self, macs: list[str]) -> int:
@@ -644,7 +927,7 @@ class JsonTaskStore:
             atomic_json(NODE_FILE, nodes)
             return len(registrations) - len(remaining)
 
-    def delete_tasks(self, task_ids: list[str]) -> tuple[int, list[str]]:
+    def delete_tasks(self, task_ids: list[str], force: bool = False) -> tuple[int, list[str]]:
         selected = {str(task_id) for task_id in task_ids if task_id}
         if not selected:
             return 0, []
@@ -664,9 +947,12 @@ class JsonTaskStore:
                 if row.get("id") in selected
                 and row.get("status") in {"assigned", "ready", "uploading", "deploying"}
             ]
-            if active:
+            if active and not force:
                 names = "、".join(str(row.get("id") or "") for row in active[:5])
                 raise ValueError(f"任务正在执行或已被客户端领取，不能删除：{names}")
+            # force=True is intentionally allowed for powered-off/crashed clients.
+            # Multicast sessions are returned to the caller so their sender thread/process
+            # can be stopped immediately after the task records are removed.
             remaining = [row for row in rows if row.get("id") not in selected]
             self._save_tasks(remaining)
             return len(rows) - len(remaining), sorted(sessions)
@@ -687,6 +973,12 @@ class JsonTaskStore:
     ) -> dict:
         target_mac = normalize_mac(target_mac) if target_mac else ""
         post_action = normalize_post_action(post_action)
+        registration = next(
+            (item for item in self.registrations() if item.get("mac") == target_mac),
+            {},
+        ) if target_mac else {}
+        registered_name = str(registration.get("name") or "")[:80]
+        registered_ip = str(registration.get("ip") or "")[:45]
         row = {
             "id": uuid.uuid4().hex[:12],
             "action": "capture",
@@ -696,7 +988,10 @@ class JsonTaskStore:
             "filesystem": filesystem,
             "status": "queued",
             "mac": "",
-            "hostname": "",
+            "hostname": registered_name,
+            "client_ip": registered_ip,
+            "registered_name": registered_name,
+            "registered_ip": registered_ip,
             "target_mac": target_mac,
             "target_group": normalize_group_name(target_group) if target_group else "",
             "post_action": post_action,
@@ -778,18 +1073,13 @@ class JsonTaskStore:
         if source_bytes <= 0:
             raise ValueError("镜像缺少源硬盘容量信息，不能安全下发")
         source_arch = normalize_architecture(str(metadata.get("source_arch") or ""))
-        if target_mac and source_arch != "unknown":
-            registration = next(
-                (item for item in self.registrations() if item.get("mac") == target_mac),
-                {},
-            )
-            target_arch = normalize_architecture(
-                str((registration.get("inventory") or {}).get("arch") or "")
-            )
-            if target_arch != "unknown" and target_arch != source_arch:
-                raise ValueError(
-                    f"镜像架构 {source_arch} 与客户端架构 {target_arch} 不一致，禁止下发"
-                )
+        registration = next(
+            (item for item in self.registrations() if item.get("mac") == target_mac),
+            {},
+        ) if target_mac else {}
+        registered_name = str(registration.get("name") or "")[:80]
+        registered_ip = str(registration.get("ip") or "")[:45]
+        compatibility_warning = architecture_warning(source_arch, registration) if target_mac else ""
         row = {
             "id": uuid.uuid4().hex[:12],
             "action": "deploy",
@@ -802,9 +1092,13 @@ class JsonTaskStore:
             "compressed_bytes": image_path.stat().st_size,
             "checksum": str(metadata.get("checksum") or ""),
             "source_arch": source_arch,
+            "compatibility_warning": compatibility_warning,
             "status": "queued",
             "mac": "",
-            "hostname": "",
+            "hostname": registered_name,
+            "client_ip": registered_ip,
+            "registered_name": registered_name,
+            "registered_ip": registered_ip,
             "target_mac": target_mac,
             "target_group": normalize_group_name(target_group) if target_group else "",
             "post_action": post_action,
@@ -831,12 +1125,15 @@ class JsonTaskStore:
             "identity_dns": identity_dns,
             "identity_status": "pending" if apply_identity else "disabled",
             "message": (
-                (
-                    f"组播会话等待 {multicast_expected} 台客户端全部上线"
-                    if transfer_mode == "multicast"
-                    else f"等待指定客户端 {target_mac} 开机自动下发"
+                ((compatibility_warning + "；") if compatibility_warning else "")
+                + (
+                    (
+                        f"组播会话等待 {multicast_expected} 台客户端全部上线"
+                        if transfer_mode == "multicast"
+                        else f"等待指定客户端 {target_mac} 开机自动下发"
+                    )
+                    if target_mac else "等待新客户端从PXE选择下发镜像"
                 )
-                if target_mac else "等待新客户端从PXE选择下发镜像"
             ),
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -904,17 +1201,21 @@ class JsonTaskStore:
                 self._save_tasks(rows)
                 return None
             image_arch = normalize_architecture(str(task.get("source_arch") or ""))
-            if mode == "deploy" and image_arch != "unknown" and client_arch != image_arch:
-                raise ValueError(
-                    f"镜像架构 {image_arch} 与当前客户端架构 {client_arch} 不一致，已阻止写盘"
-                )
+            claim_warning = ""
+            if mode == "deploy" and image_arch != "unknown" and client_arch != "unknown" and client_arch != image_arch:
+                claim_warning = f"CPU架构不匹配：镜像 {image_arch}，客户端 {client_arch}；管理员已确认继续下发"
+                task["compatibility_warning"] = claim_warning
             task["status"] = "assigned"
             task["mac"] = mac
             task["hostname"] = display_name
+            task["registered_name"] = display_name
+            task["registered_ip"] = str(registration.get("ip") or "")[:45]
+            task["reported_ip"] = str(node["ip"] or "")[:45]
             task["client_ip"] = str(registration.get("ip") or node["ip"])[:45]
             task["client_arch"] = client_arch
             task["message"] = (
-                f"检测到{disk_analysis['count']}块有效硬盘；"
+                (claim_warning + "；" if claim_warning else "")
+                + f"检测到{disk_analysis['count']}块有效硬盘；"
                 f"候选系统盘 {disk_analysis['selected'] or '无'}；"
                 f"{disk_analysis['system_hint']}；客户端已领取{('上传' if mode == 'capture' else '下发')}任务"
             )
@@ -1266,18 +1567,65 @@ class MulticastCoordinator:
         candidates: list[Path] = []
         if os.name == "nt" and machine in {"amd64", "x86_64"}:
             candidates.append(ROOT / "tools" / "udpcast" / "windows-x64" / "udp-sender.exe")
-        elif os.name != "nt" and machine in {"amd64", "x86_64"}:
-            candidates.append(ROOT / "tools" / "udpcast" / "linux-x86_64" / "udp-sender")
+        elif os.name != "nt":
+            if machine in {"amd64", "x86_64"}:
+                candidates.append(ROOT / "tools" / "udpcast" / "linux-x86_64" / "udp-sender")
+            elif machine in {"aarch64", "arm64"}:
+                candidates.append(ROOT / "tools" / "udpcast" / "linux-aarch64" / "udp-sender")
+            elif machine in {"loongarch64", "loong64"}:
+                candidates.append(ROOT / "tools" / "udpcast" / "linux-loongarch64" / "udp-sender")
         system_sender = shutil.which("udp-sender")
         if system_sender:
             candidates.append(Path(system_sender))
         for candidate in candidates:
-            if candidate.is_file():
+            if candidate.is_file() and os.access(candidate, os.X_OK):
                 return candidate
         raise ValueError(
-            f"当前管理端架构 {platform.system()}/{platform.machine()} 没有可用的 udp-sender；"
-            "请安装 udpcast，或使用随包支持的 Windows/Linux x86_64 管理端"
+            f"当前管理端架构 {platform.system()}/{platform.machine()} 没有可用的 udp-sender。"
         )
+
+    @staticmethod
+    def udpcast_install_command() -> list[str] | None:
+        if os.name == "nt":
+            return None
+        installers = (
+            ("apt-get", ["apt-get", "install", "-y", "udpcast"]),
+            ("dnf", ["dnf", "install", "-y", "udpcast"]),
+            ("yum", ["yum", "install", "-y", "udpcast"]),
+            ("zypper", ["zypper", "--non-interactive", "install", "udpcast"]),
+        )
+        for exe, cmd in installers:
+            if shutil.which(exe):
+                if hasattr(os, "geteuid") and os.geteuid() == 0:
+                    return cmd
+                sudo = shutil.which("sudo")
+                if sudo:
+                    return [sudo, *cmd]
+                pkexec = shutil.which("pkexec")
+                if pkexec:
+                    return [pkexec, *cmd]
+                return None
+        return None
+
+    def install_udpcast(self) -> tuple[bool, str]:
+        cmd = self.udpcast_install_command()
+        if not cmd:
+            return False, "没有检测到可用的软件包管理器或提权工具。"
+        try:
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=180, check=False,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if result.returncode != 0:
+            detail = (result.stdout or "").strip()[-1200:]
+            return False, detail or f"安装命令退出码 {result.returncode}"
+        try:
+            self.sender_path()
+        except ValueError:
+            return False, "udpcast 安装完成，但仍未找到 udp-sender。"
+        return True, "udpcast 已安装，可以使用组播。"
 
     def prepare(self, task_id: str, mac: str) -> dict:
         summary = self.store.multicast_ready(task_id, mac)
@@ -1293,16 +1641,22 @@ class MulticastCoordinator:
             for row in summary.get("rows") or []
         }
         source_architectures.discard("unknown")
-        if source_architectures == {"loongarch64"}:
-            return "zosmc1"
         architectures = {
             normalize_architecture(str(row.get("client_arch") or ""))
             for row in summary.get("rows") or []
         }
         architectures.discard("unknown")
-        if "loongarch64" in architectures:
-            if architectures != {"loongarch64"}:
-                raise ValueError("组播会话不能混合龙芯与其他CPU架构")
+        # ARM64 and LoongArch64 PXE environments ship the architecture-neutral
+        # ZOSMC receiver, so they never depend on an Internet-installed udpcast.
+        # Mixed ARM64/LoongArch64 groups are also transport-compatible; image/CPU
+        # mismatch remains a warn-only administrator choice at task creation.
+        if architectures in ({"arm64"}, {"loongarch64"}):
+            return "zosmc1"
+        if "loongarch64" in architectures and len(architectures) > 1:
+            raise ValueError("组播会话不能混合龙芯与其他CPU架构")
+        if source_architectures and source_architectures.issubset({"arm64", "loongarch64"}):
+            # Old registrations may not yet have client_arch; use image/source arch
+            # as a safe compatibility fallback for the first upgraded boot.
             return "zosmc1"
         return "udpcast"
 
@@ -1346,11 +1700,11 @@ class MulticastCoordinator:
             image_path = Path(summary["image_path"]).resolve()
             image_path.relative_to(IMAGE_DIR.resolve())
             if not image_path.is_file():
-                raise ValueError("龙芯组播镜像文件不存在")
+                raise ValueError("ZOS可靠组播镜像文件不存在")
             rows = summary["rows"]
             expected_macs = [str(row.get("mac") or "") for row in rows]
             if not all(expected_macs):
-                raise ValueError("龙芯组播任务缺少客户端MAC")
+                raise ValueError("ZOS可靠组播任务缺少客户端MAC")
             profile = normalize_multicast_profile(
                 str(rows[0].get("multicast_profile") or "gigabit")
             )
@@ -1358,7 +1712,7 @@ class MulticastCoordinator:
             expected = int(summary["expected"])
             self.store.set_multicast_state(
                 session_id, "starting",
-                f"等待 {expected} 台龙芯接收器完成可靠组播握手；"
+                f"等待 {expected} 台ZOS接收器完成可靠组播握手；"
                 f"组 {group_for_session(session_id)}，UDP {portbase}/{portbase + 1}",
             )
 
@@ -1366,14 +1720,14 @@ class MulticastCoordinator:
                 if message == "all_receivers_connected":
                     self.store.set_multicast_state(
                         session_id, "running",
-                        f"龙芯可靠组播进行中：{expected}台，{multicast_profile_text(profile)}，"
+                        f"ZOS可靠组播进行中：{expected}台，{multicast_profile_text(profile)}，"
                         f"UDP {portbase}/{portbase + 1}",
                     )
-                elif message.startswith("龙芯接收器握手"):
+                elif message.startswith("龙芯接收器握手") or message.startswith("ZOS接收器握手"):
                     self.store.set_multicast_state(session_id, "starting", message)
 
             self.log_callback(
-                f"ZOS龙芯组播准备：会话 {session_id}，{expected}台，"
+                f"ZOS可靠组播准备：会话 {session_id}，{expected}台，"
                 f"{group_for_session(session_id)}，UDP {portbase}/{portbase + 1}"
             )
             send_zos_multicast(
@@ -1383,17 +1737,17 @@ class MulticastCoordinator:
                 data_port=portbase,
                 expected_macs=expected_macs,
                 profile=profile,
-                start_timeout=int(self.config.get("multicast_start_timeout", 900)),
+                start_timeout=max(10, min(300, int(self.config.get("zosmc_handshake_timeout", 60)))),
                 cancel_event=cancel_event,
                 state_callback=state,
             )
             self.store.set_multicast_state(
-                session_id, "sent", "龙芯组播数据及SHA-256校验完成，等待客户端写盘确认"
+                session_id, "sent", "ZOS组播数据及SHA-256校验完成，等待客户端写盘确认"
             )
-            self.log_callback(f"ZOS龙芯组播发送完成：会话 {session_id}")
+            self.log_callback(f"ZOS可靠组播发送完成：会话 {session_id}")
         except Exception as exc:
-            self.store.set_multicast_state(session_id, "failed", f"龙芯组播失败：{exc}")
-            self.log_callback(f"ZOS龙芯组播失败：会话 {session_id}，{exc}")
+            self.store.set_multicast_state(session_id, "failed", f"ZOS组播失败：{exc}")
+            self.log_callback(f"ZOS可靠组播失败：会话 {session_id}，{exc}")
         finally:
             with self.lock:
                 self.processes.pop(session_id, None)
@@ -1847,6 +2201,193 @@ class GroupTaskDialog(QDialog):
             self.apply_ip.setChecked(False)
 
 
+class ClientIdentityEditDialog(QDialog):
+    """Edit one client directly, or generate sequential names/IPs for a selection."""
+
+    def __init__(self, clients: list[dict], subnet_mask: str, parent=None):
+        super().__init__(parent)
+        self.clients = [dict(row) for row in clients]
+        self.subnet_mask = str(subnet_mask or "255.255.255.0")
+        self._updates: list[dict] = []
+        self.single = len(self.clients) == 1
+        self.setWindowTitle(
+            "修改客户端IP和计算机名" if self.single
+            else f"批量修改IP和计算机名（{len(self.clients)}台）"
+        )
+        self.resize(610, 330 if self.single else 445)
+        form = QFormLayout(self)
+
+        self.apply_name = QCheckBox(
+            "修改这台客户端的名称/计算机名" if self.single
+            else "按顺序批量修改名称/计算机名"
+        )
+        self.apply_ip = QCheckBox(
+            "修改这台客户端的注册IP" if self.single
+            else "从起始IP开始连续分配"
+        )
+        self.apply_name.setChecked(True)
+        self.apply_ip.setChecked(True)
+        form.addRow("修改项目：", self.apply_name)
+        form.addRow("", self.apply_ip)
+
+        first = self.clients[0] if self.clients else {}
+        if self.single:
+            form.addRow("客户端MAC：", QLabel(str(first.get("mac") or "")))
+            self.name_value = QLineEdit(str(first.get("name") or ""))
+            self.ip_value = QLineEdit(str(first.get("ip") or ""))
+            self.ip_value.setPlaceholderText("可留空；留空表示不保存固定注册IP")
+            form.addRow("名称/计算机名：", self.name_value)
+            form.addRow("注册IP：", self.ip_value)
+            self.apply_name.stateChanged.connect(
+                lambda _state: self.name_value.setEnabled(self.apply_name.isChecked())
+            )
+            self.apply_ip.stateChanged.connect(
+                lambda _state: self.ip_value.setEnabled(self.apply_ip.isChecked())
+            )
+        else:
+            inferred_prefix = "ZOS-"
+            inferred_start = 1
+            inferred_digits = 3
+            match = re.fullmatch(r"(.*?)(\d+)", str(first.get("name") or ""))
+            if match:
+                inferred_prefix = match.group(1)
+                inferred_start = int(match.group(2))
+                inferred_digits = max(1, len(match.group(2)))
+            self.name_prefix = QLineEdit(inferred_prefix)
+            self.name_start = QLineEdit(str(inferred_start))
+            self.name_digits = QLineEdit(str(inferred_digits))
+            self.ip_start = QLineEdit(str(first.get("ip") or ""))
+            self.ip_start.setPlaceholderText("例如 192.168.5.101")
+            self.assignment_order = QComboBox()
+            self.assignment_order.addItem("正序（当前列表从上到下）", "forward")
+            self.assignment_order.addItem("倒序（当前列表从下到上）", "reverse")
+            form.addRow("名称前缀：", self.name_prefix)
+            form.addRow("起始编号：", self.name_start)
+            form.addRow("编号位数：", self.name_digits)
+            form.addRow("起始IP：", self.ip_start)
+            form.addRow("分配方向：", self.assignment_order)
+            order = QLabel(
+                "先点击客户端列表标题完成排序，再选择需要修改的客户端。正序把起始编号/IP分配给"
+                "当前列表最上方的选中客户端；倒序则从最下方开始分配。"
+            )
+            order.setWordWrap(True)
+            form.addRow("批量规则：", order)
+            for widget in (self.name_prefix, self.name_start, self.name_digits):
+                self.apply_name.stateChanged.connect(
+                    lambda _state, target=widget: target.setEnabled(self.apply_name.isChecked())
+                )
+            self.apply_ip.stateChanged.connect(
+                lambda _state: self.ip_start.setEnabled(self.apply_ip.isChecked())
+            )
+
+        note = QLabel(
+            "这里的IP和名称是已注册客户端的统一身份信息。新建或尚未领取的镜像任务会同步更新；"
+            "客户端PXE启动时临时获得的地址只作为在线通信地址，不再覆盖这里的注册IP。"
+            "正在写盘或已经完成的历史任务不会被反向修改。"
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def build_updates(self) -> list[dict]:
+        if not self.clients:
+            raise ValueError("没有选中客户端")
+        change_name = self.apply_name.isChecked()
+        change_ip = self.apply_ip.isChecked()
+        if not change_name and not change_ip:
+            raise ValueError("请至少勾选一个修改项目")
+
+        direction = (
+            self.assignment_order.currentData()
+            if not self.single else "forward"
+        )
+        ordered_clients = clients_in_batch_direction(self.clients, direction)
+
+        generated_names: list[str] = []
+        generated_ips: list[str] = []
+        if change_name:
+            if self.single:
+                name = self.name_value.text().strip()
+                if not name:
+                    raise ValueError("名称/计算机名不能为空")
+                generated_names = [name[:80]]
+            else:
+                try:
+                    start = int(self.name_start.text().strip())
+                    digits = int(self.name_digits.text().strip())
+                except ValueError as exc:
+                    raise ValueError("起始编号和编号位数必须是整数") from exc
+                if start < 0:
+                    raise ValueError("起始编号不能小于0")
+                if not 1 <= digits <= 10:
+                    raise ValueError("编号位数应为1到10")
+                prefix = self.name_prefix.text().strip()
+                generated_names = [
+                    f"{prefix}{start + index:0{digits}d}"[:80]
+                    for index in range(len(ordered_clients))
+                ]
+                if len(set(generated_names)) != len(generated_names):
+                    raise ValueError("生成的客户端名称存在重复，请调整前缀或编号")
+
+        if change_ip:
+            if self.single:
+                raw = self.ip_value.text().strip()
+                generated_ips = [str(ipaddress.IPv4Address(raw)) if raw else ""]
+            else:
+                raw = self.ip_start.text().strip()
+                if not raw:
+                    raise ValueError("批量修改IP时必须填写起始IP")
+                start_ip = ipaddress.IPv4Address(raw)
+                try:
+                    network = ipaddress.IPv4Network(
+                        f"{start_ip}/{self.subnet_mask}", strict=False
+                    )
+                except ValueError as exc:
+                    raise ValueError("当前子网掩码无效，不能批量连续分配IP") from exc
+                generated_ips = []
+                for index in range(len(ordered_clients)):
+                    try:
+                        address = ipaddress.IPv4Address(int(start_ip) + index)
+                    except ipaddress.AddressValueError as exc:
+                        raise ValueError("批量IP超出IPv4地址范围") from exc
+                    if address not in network or address in {
+                        network.network_address, network.broadcast_address,
+                    }:
+                        raise ValueError(
+                            f"批量IP {address} 已超出当前子网可用主机地址范围"
+                        )
+                    generated_ips.append(str(address))
+
+        updates: list[dict] = []
+        for index, client in enumerate(ordered_clients):
+            updates.append({
+                "mac": str(client.get("mac") or ""),
+                "name": (
+                    generated_names[index] if change_name
+                    else str(client.get("name") or "")
+                ),
+                "ip": (
+                    generated_ips[index] if change_ip
+                    else str(client.get("ip") or "")
+                ),
+            })
+        return updates
+
+    def accept(self):
+        try:
+            self._updates = self.build_updates()
+        except ValueError as exc:
+            QMessageBox.warning(self, "修改内容无效", str(exc))
+            return
+        super().accept()
+
+    def result_updates(self) -> list[dict]:
+        return [dict(row) for row in self._updates]
+
+
 MODERN_STYLE = """
 QMainWindow, QWidget#appRoot {
     background: #eef2fa;
@@ -1988,10 +2529,141 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 
 
+
+class ImageCatalogDialog(QDialog):
+    def __init__(self, catalog: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("镜像库")
+        self.resize(980, 520)
+        layout = QVBoxLayout(self)
+        tools = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜索镜像名称、架构、标签或备注")
+        refresh = QPushButton("刷新")
+        open_dir = QPushButton("打开镜像目录")
+        tools.addWidget(self.search, 1)
+        tools.addWidget(refresh)
+        tools.addWidget(open_dir)
+        layout.addLayout(tools)
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["镜像", "架构", "类型", "源容量", "压缩大小", "创建时间", "标签", "备注"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+        self.catalog = catalog
+        self.search.textChanged.connect(self.refresh_rows)
+        refresh.clicked.connect(self.reload)
+        open_dir.clicked.connect(self.open_directory)
+        self.refresh_rows()
+
+    def reload(self):
+        self.catalog = rebuild_image_catalog()
+        self.refresh_rows()
+
+    def refresh_rows(self):
+        key = self.search.text().strip().lower()
+        rows = []
+        for row in self.catalog:
+            text = " ".join([
+                str(row.get("name") or ""), str(row.get("architecture") or ""),
+                str(row.get("image_type") or ""), " ".join(map(str, row.get("tags") or [])),
+                str(row.get("note") or "")
+            ]).lower()
+            if not key or key in text:
+                rows.append(row)
+        self.table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            source = int(row.get("source_bytes") or 0)
+            compressed = int(row.get("compressed_bytes") or 0)
+            values = [
+                row.get("name") or row.get("file") or "",
+                row.get("architecture") or "unknown",
+                row.get("image_type") or "unknown",
+                f"{source / 1024 / 1024 / 1024:.1f} GiB" if source else "-",
+                f"{compressed / 1024 / 1024:.1f} MiB",
+                row.get("created_at") or "",
+                ", ".join(map(str, row.get("tags") or [])),
+                row.get("note") or "",
+            ]
+            for c, value in enumerate(values):
+                self.table.setItem(r, c, QTableWidgetItem(str(value)))
+
+    def open_directory(self):
+        path = str(IMAGE_DIR.resolve())
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            QMessageBox.warning(self, "打开失败", str(exc))
+
+
+class PreflightDialog(QDialog):
+    def __init__(self, config: dict, pxe, catalog: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("部署环境自检")
+        self.resize(760, 520)
+        layout = QVBoxLayout(self)
+        self.text = QTextEdit()
+        self.text.setReadOnly(True)
+        layout.addWidget(self.text)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.run_checks(config, pxe, catalog)
+
+    def run_checks(self, config, pxe, catalog):
+        results = []
+        def add(ok, title, detail=""):
+            results.append(("✓" if ok else "✗", title, detail))
+        add(IMAGE_DIR.is_dir(), "镜像目录", str(IMAGE_DIR))
+        add(bool(catalog), "镜像文件", f"共 {len(catalog)} 个 .img.zst 镜像")
+        tftp_root = Path(str(config.get("tftp_root") or ""))
+        add(tftp_root.is_dir(), "TFTP 目录", str(tftp_root))
+        required = ["undionly.kpxe", "ipxe.efi", "ipxe-arm64.efi", "ipxe-loongarch64.efi"]
+        missing = [name for name in required if not (tftp_root / name).exists()]
+        add(not missing, "多架构 PXE 文件", "正常" if not missing else "缺少：" + ", ".join(missing))
+        server_ip = str(config.get("pxe_server_ip") or "").strip()
+        try:
+            ipaddress.ip_address(server_ip)
+            add(True, "服务器 IP", server_ip)
+        except ValueError:
+            add(False, "服务器 IP", f"无效：{server_ip}")
+        try:
+            net = ipaddress.ip_network(f"{server_ip}/{config.get('dhcp_subnet_mask')}", strict=False)
+            start = ipaddress.ip_address(str(config.get("dhcp_pool_start")))
+            end = ipaddress.ip_address(str(config.get("dhcp_pool_end")))
+            add(start in net and end in net and int(start) <= int(end), "DHCP 地址池", f"{start} - {end}")
+        except Exception as exc:
+            add(False, "DHCP 地址池", str(exc))
+        try:
+            free = shutil.disk_usage(ROOT).free
+            add(free >= 5 * 1024**3, "管理端磁盘空间", f"剩余 {free / 1024**3:.1f} GiB")
+        except Exception as exc:
+            add(False, "管理端磁盘空间", str(exc))
+        interfaces = pxe.interfaces()
+        add(bool(interfaces), "部署网卡", "已发现 %d 个可用网卡" % len(interfaces))
+        selected = str(config.get("pxe_interface_name") or "")
+        add(any(i.get("name") == selected for i in interfaces) if selected else bool(interfaces), "当前网卡", selected or "将使用首个可用网卡")
+        lines = ["部署前快速检查", ""]
+        for icon, title, detail in results:
+            lines.append(f"{icon} {title}：{detail}")
+        bad = sum(1 for icon, *_ in results if icon == "✗")
+        lines += ["", "结果：" + ("可以开始部署" if bad == 0 else f"发现 {bad} 项需要处理")]
+        self.text.setPlainText("\n".join(lines))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"菁云镜像部署系统 {VERSION}（无HTTP/无数据库）")
+        self.image_catalog = rebuild_image_catalog()
         self.resize(1420, 900)
         self.setMinimumSize(1120, 760)
         self.config = default_config()
@@ -2123,9 +2795,12 @@ class MainWindow(QMainWindow):
         self.client_groups = QLineEdit("，".join(normalize_group_list(self.config.get("client_groups"))))
         self.save_groups_button = QPushButton("保存客户端分组")
         self.save_groups_button.clicked.connect(self.save_group_settings)
+        self.preflight_button = QPushButton("部署环境自检")
+        self.preflight_button.clicked.connect(self.show_preflight)
         groups.addWidget(QLabel("客户端分组（逗号分隔，第一项为默认组）"))
         groups.addWidget(self.client_groups, 1)
         groups.addWidget(self.save_groups_button)
+        groups.addWidget(self.preflight_button)
         groups.addWidget(QLabel("列表筛选"))
         self.group_filter = QComboBox()
         self.group_filter.currentIndexChanged.connect(self.refresh_clients)
@@ -2150,6 +2825,8 @@ class MainWindow(QMainWindow):
         self.group_task_button = QPushButton("设置当前组任务")
         self.wake_selected_button = QPushButton("唤醒选中")
         self.wake_group_button = QPushButton("唤醒当前组")
+        self.edit_clients_button = QPushButton("修改IP/计算机名")
+        self.edit_clients_button.setObjectName("primaryButton")
         self.import_clients_button = QPushButton("导入客户端")
         self.export_clients_button = QPushButton("导出客户端")
         self.select_all_clients_button = QPushButton("全选")
@@ -2159,29 +2836,36 @@ class MainWindow(QMainWindow):
         self.group_task_button.clicked.connect(self.set_group_task)
         self.wake_selected_button.clicked.connect(self.wake_selected_clients)
         self.wake_group_button.clicked.connect(self.wake_current_group)
+        self.edit_clients_button.clicked.connect(self.edit_selected_clients)
         self.import_clients_button.clicked.connect(self.import_clients)
         self.export_clients_button.clicked.connect(self.export_clients)
         self.select_all_clients_button.clicked.connect(self.client_table_select_all)
         self.delete_clients_button.clicked.connect(self.delete_selected_clients)
         for button in (
             self.registration_button, self.group_task_button, self.wake_selected_button,
-            self.wake_group_button, self.import_clients_button, self.export_clients_button,
-            self.select_all_clients_button, self.delete_clients_button,
+            self.wake_group_button, self.edit_clients_button, self.import_clients_button,
+            self.export_clients_button, self.select_all_clients_button,
+            self.delete_clients_button,
         ):
             client_actions.addWidget(button)
         client_actions.addStretch()
         client_layout.addLayout(client_actions)
-        self.client_table = QTableWidget(0, 9)
+        self.client_table = QTableWidget(0, 13)
         self.client_table.setObjectName("dataTable")
         self.client_table.setHorizontalHeaderLabels(
-            ["状态", "客户端名称", "IP", "MAC", "组", "硬盘数", "候选系统盘", "系统判断", "注册时间"]
+            ["状态", "客户端名称", "注册IP", "MAC", "组", "架构", "CPU", "核心", "内存", "硬盘容量", "硬盘数", "候选系统盘", "注册时间"]
         )
         self.client_table.horizontalHeader().setStretchLastSection(True)
         self.client_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.client_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.client_table.setAlternatingRowColors(True)
         self.client_table.verticalHeader().setVisible(False)
-        self.client_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        client_header = self.client_table.horizontalHeader()
+        client_header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        client_header.setSectionsClickable(True)
+        client_header.setSortIndicatorShown(True)
+        self.client_table.setSortingEnabled(True)
+        self.client_table.sortItems(8, Qt.DescendingOrder)
         self.client_table.cellDoubleClicked.connect(lambda _row, _column: self.register_client_task())
         client_layout.addWidget(self.client_table)
         layout.addWidget(client_card, 4)
@@ -2195,24 +2879,31 @@ class MainWindow(QMainWindow):
         task_title = QLabel("镜像任务")
         task_title.setObjectName("sectionTitle")
         task_tools.addWidget(task_title)
+        self.image_library_button = QPushButton("镜像库")
+        self.image_library_button.clicked.connect(self.show_image_catalog)
+        task_tools.addWidget(self.image_library_button)
         task_tools.addStretch()
         self.cancel_button = QPushButton("取消选中任务")
         self.select_all_tasks_button = QPushButton("全选")
-        self.delete_tasks_button = QPushButton("删除选中任务")
+        self.delete_tasks_button = QPushButton("删除任务")
         self.delete_tasks_button.setObjectName("dangerButton")
+        self.clear_tasks_button = QPushButton("清空任务")
+        self.clear_tasks_button.setObjectName("dangerButton")
         self.cancel_button.clicked.connect(self.cancel_task)
         self.select_all_tasks_button.clicked.connect(self.task_table_select_all)
         self.delete_tasks_button.clicked.connect(self.delete_selected_tasks)
+        self.clear_tasks_button.clicked.connect(self.clear_all_tasks)
         task_tools.addWidget(self.cancel_button)
         task_tools.addWidget(self.select_all_tasks_button)
         task_tools.addWidget(self.delete_tasks_button)
+        task_tools.addWidget(self.clear_tasks_button)
         task_layout.addLayout(task_tools)
         self.table = QTableWidget(0, 17)
         self.table.setObjectName("dataTable")
         self.table.setHorizontalHeaderLabels(
             [
                 "ID", "类型", "方式", "镜像", "设备", "完成后", "状态",
-                "客户端", "IP", "分组", "进度", "已写入", "开始时间",
+                "客户端", "注册IP", "分组", "进度", "已写入", "开始时间",
                 "耗时", "个性化", "信息", "创建时间",
             ]
         )
@@ -2247,6 +2938,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self.setStyleSheet(MODERN_STYLE)
         self.refresh_group_filter()
+
+    def show_image_catalog(self):
+        self.image_catalog = rebuild_image_catalog()
+        ImageCatalogDialog(self.image_catalog, self).exec_()
+
+    def show_preflight(self):
+        self.image_catalog = rebuild_image_catalog()
+        PreflightDialog(self.config, self.pxe, self.image_catalog, self).exec_()
 
     def refresh_nics(self):
         selected = self.config.get("pxe_interface_name", "")
@@ -2377,8 +3076,8 @@ choose --default local --timeout {timeout_ms} target || goto local
 goto ${{target}}
 
 :register
-kernel tftp://{server}/${{zos_arch}}/zos/${{zos_kernel}} ${{zos_args}} jy_mode=register jy_server={server} jy_port={port} jy_token={token} mac=${{net0/mac}}
-initrd tftp://{server}/${{zos_arch}}/zos/${{zos_init}}
+kernel tftp://{server}/${{zos_arch}}/zos/${{zos_kernel}} ${{zos_args}} ${{zos_netargs}} jy_mode=register jy_server={server} jy_port={port} jy_token={token} mac=${{net0/mac}}
+initrd --name ${{zos_init}} tftp://{server}/${{zos_arch}}/zos/${{zos_init}}
 boot || goto failed
 
 :local
@@ -2420,8 +3119,8 @@ goto menu
             script = f"""#!ipxe
 {ipxe_architecture_setup()}
 echo Automatic {mode} task {task.get('id', '')} for {mac}
-kernel tftp://{server}/${{zos_arch}}/zos/${{zos_kernel}} ${{zos_args}} jy_mode={mode} jy_auto=1 jy_server={server} jy_port={port} jy_token={token} mac=${{net0/mac}}
-initrd tftp://{server}/${{zos_arch}}/zos/${{zos_init}}
+kernel tftp://{server}/${{zos_arch}}/zos/${{zos_kernel}} ${{zos_args}} ${{zos_netargs}} jy_mode={mode} jy_auto=1 jy_server={server} jy_port={port} jy_token={token} mac=${{net0/mac}}
+initrd --name ${{zos_init}} tftp://{server}/${{zos_arch}}/zos/${{zos_init}}
 boot
 """
             target = root / f"{mac.replace(':', '-')}.ipxe"
@@ -2544,13 +3243,31 @@ boot
                     if identity else
                     "计算机名：保留镜像原名称\nIPv4：保持DHCP自动获取\n"
                 )
+                image_path = (IMAGE_DIR / Path(image_file).name).resolve()
+                image_meta = read_json(image_path.with_suffix(image_path.suffix + ".json"), {})
+                image_arch = normalize_architecture(str(image_meta.get("source_arch") or ""))
+                known_registration = next(
+                    (item for item in self.store.registrations() if item.get("mac") == mac), {}
+                )
+                hw = client_hardware_info(known_registration)
+                mismatch = architecture_warning(image_arch, known_registration)
+                hardware_text = (
+                    f"硬件：{hw['arch']} / {hw['cpu_model']}"
+                    + (f" / {hw['cpu_cores']}核" if hw['cpu_cores'] else "")
+                    + f" / 内存 {format_bytes_gib(hw['memory_bytes'])}"
+                    + f" / 最大硬盘 {format_bytes_gib(hw['largest_disk_bytes'])}\n"
+                )
+                compatibility_text = (
+                    f"\n⚠ {mismatch}\n这只是兼容性提示，仍可选择继续下发。\n"
+                    if mismatch else "\n兼容性：CPU架构未发现不匹配。\n"
+                )
                 answer = QMessageBox.warning(
                     self,
                     "确认自动下发",
-                    f"客户端：{name} ({mac})\n镜像：{image_file}\n目标盘：{device}\n"
-                    + identity_text
+                    f"客户端：{name} ({mac})\n镜像：{image_file}\n镜像架构：{image_arch}\n目标盘：{device}\n"
+                    + hardware_text + identity_text + compatibility_text
                     + "\n"
-                    "该客户端下次PXE开机将自动覆盖目标硬盘，确认继续吗？",
+                    "该客户端下次PXE开机将自动覆盖目标硬盘，是否继续下发？",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No,
                 )
@@ -2565,17 +3282,18 @@ boot
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "客户端任务设置失败", str(exc))
             return
-        self.refresh_view()
         if task:
-            QMessageBox.information(
-                self, "设置完成",
-                f"客户端：{name}\n任务：{task['id']}\n该任务将在此客户端下次PXE开机时自动执行一次。",
+            self.pxe.log(
+                f"客户端任务设置成功：{name} ({mac})，任务 {task['id']}，"
+                "下次PXE开机自动执行一次"
             )
         else:
-            QMessageBox.information(
-                self, "设置完成",
-                f"客户端 {name} 没有待执行任务，PXE启动时将倒计时进入本地系统。",
+            self.pxe.log(
+                f"客户端启动策略设置成功：{name} ({mac})，无待执行任务，"
+                "PXE启动时倒计时进入本地系统"
             )
+        # 关闭设置窗口后任务会立即出现在列表中；不再弹出第二个“设置完成”窗口。
+        self.refresh_view()
 
     def set_group_task(self):
         group = self.current_group()
@@ -2613,18 +3331,55 @@ boot
             )
             return
         if action == "deploy" and transfer_mode == "multicast":
+            client_arches = {
+                normalize_architecture(str(client.get("arch") or ""))
+                for client in clients
+            }
+            client_arches.discard("unknown")
+            # ARM64/LoongArch64 use the built-in ZOSMC reliable multicast path.
+            # x86_64 keeps upstream UDPcast compatibility for now.
+            needs_udpcast = client_arches not in ({"arm64"}, {"loongarch64"})
+            if needs_udpcast:
+                try:
+                    self.multicast.sender_path()
+                except ValueError:
+                    machine = platform.machine()
+                    bundled = ROOT / "tools" / "udpcast" / (
+                        "linux-aarch64" if machine.lower() in {"aarch64", "arm64"}
+                        else "linux-x86_64" if machine.lower() in {"amd64", "x86_64"}
+                        else "linux-loongarch64"
+                    ) / "udp-sender"
+                    QMessageBox.warning(
+                        self, "缺少离线组播组件",
+                        f"当前管理端为 {platform.system()}/{machine}，未找到可用的 udp-sender。\n\n"
+                        "部署网络允许完全离线运行，本程序不会再尝试 apt/yum 在线安装。\n"
+                        f"请把对应架构的 udp-sender 放到：\n{bundled}\n"
+                        "并赋予执行权限后重新选择组播。",
+                    )
+                    return
+        group_image_arch = "unknown"
+        group_mismatches: list[dict] = []
+        if action == "deploy":
             try:
-                self.multicast.sender_path()
-            except ValueError as exc:
-                QMessageBox.warning(self, "组播组件不可用", str(exc))
-                return
+                preview_image = (IMAGE_DIR / Path(image_file).name).resolve()
+                preview_image.relative_to(IMAGE_DIR.resolve())
+                preview_meta = read_json(preview_image.with_suffix(preview_image.suffix + ".json"), {})
+                group_image_arch = normalize_architecture(str(preview_meta.get("source_arch") or ""))
+                group_mismatches = [
+                    client for client in clients
+                    if group_image_arch != "unknown"
+                    and normalize_architecture(str(client.get("arch") or "")) != "unknown"
+                    and normalize_architecture(str(client.get("arch") or "")) != group_image_arch
+                ]
+            except (OSError, ValueError):
+                pass
         warning = (
             f"分组：{group}\n客户端数量：{len(clients)}\n"
             f"任务：{'分别上传模板' if action == 'capture' else '部署同一镜像'}\n\n"
         )
         if action == "deploy":
             warning += (
-                f"镜像：{image_file}\n目标盘：{device}\n"
+                f"镜像：{image_file}\n镜像架构：{group_image_arch}\n目标盘：{device}\n"
                 f"下发方式：{transfer_mode_text(transfer_mode)}\n"
                 + (
                     f"组播速度：{multicast_profile_text(multicast_profile)}\n"
@@ -2637,6 +3392,18 @@ boot
                         f"网关：{self.gateway.text().strip() or '空'}\n"
                         f"DNS：{', '.join(value for value in (self.dns1.text().strip(), self.dns2.text().strip()) if value) or '空'}\n"
                     )
+                )
+                + (
+                    (
+                        "\n⚠ CPU架构不匹配客户端：" + str(len(group_mismatches)) + " 台\n"
+                        + "\n".join(
+                            f"  {item.get('name') or item.get('mac')}：{item.get('arch') or 'unknown'}"
+                            for item in group_mismatches[:12]
+                        )
+                        + (f"\n  ……另有 {len(group_mismatches)-12} 台" if len(group_mismatches) > 12 else "")
+                        + "\n这只是兼容性提示，可继续为整个分组建立任务。\n"
+                    )
+                    if group_mismatches else "\n兼容性：组内已识别客户端CPU架构未发现不匹配。\n"
                 )
                 +
                 "将覆盖组内客户端目标硬盘上的全部分区和数据，无法撤销。\n\n"
@@ -2820,7 +3587,7 @@ boot
         path = Path(filename)
         if not path.suffix:
             path = path.with_suffix(".txt" if "文本" in selected_filter else ".xlsx")
-        headers = ["状态", "客户端名称", "IP", "MAC", "组", "硬盘数", "候选系统盘", "系统判断", "注册时间"]
+        headers = ["状态", "客户端名称", "注册IP", "MAC", "组", "硬盘数", "候选系统盘", "系统判断", "注册时间"]
         values = [
             [
                 row["status"], row["name"], row["ip"], row["mac"], row["group"],
@@ -2935,16 +3702,63 @@ boot
         )
         if answer != QMessageBox.Yes:
             return
+        force = False
         try:
             deleted, sessions = self.store.delete_tasks(task_ids)
         except ValueError as exc:
-            QMessageBox.warning(self, "不能删除", str(exc))
-            return
+            if "正在执行" not in str(exc) and "已经领取" not in str(exc):
+                QMessageBox.warning(self, "不能删除", str(exc))
+                return
+            force_answer = QMessageBox.warning(
+                self, "任务仍标记为执行中",
+                str(exc) + "\n\n客户端可能已经关机、死机或网络中断。\n"
+                "是否强制删除这些任务？\n\n"
+                "强制删除只清理任务和发送会话，不会删除镜像文件。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if force_answer != QMessageBox.Yes:
+                return
+            force = True
+            deleted, sessions = self.store.delete_tasks(task_ids, force=True)
         for session_id in sessions:
             self.multicast.stop_session(session_id)
         self.refresh_view()
         self.pxe.log(f"批量删除任务：{deleted} 条")
         QMessageBox.information(self, "删除完成", f"已删除 {deleted} 条任务记录。")
+
+    def clear_all_tasks(self):
+        rows = self.store.tasks()
+        if not rows:
+            QMessageBox.information(self, "暂无任务", "镜像任务列表已经为空。")
+            return
+        answer = QMessageBox.warning(
+            self, "确认清空任务",
+            f"将清空当前全部 {len(rows)} 条任务记录。\n"
+            "如有执行中/已领取任务，可在下一步选择强制清空；镜像文件不会删除。\n\n"
+            "确认继续吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        all_ids = [str(row.get("id") or "") for row in rows]
+        try:
+            deleted, sessions = self.store.delete_tasks(all_ids)
+        except ValueError as exc:
+            force_answer = QMessageBox.warning(
+                self, "存在执行中任务",
+                str(exc) + "\n\n部分客户端可能已经关机、死机或网络中断。\n"
+                "是否强制清空全部任务？\n\n"
+                "只清理任务记录和组播发送会话，不会删除镜像文件。",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if force_answer != QMessageBox.Yes:
+                return
+            deleted, sessions = self.store.delete_tasks(all_ids, force=True)
+        for session_id in sessions:
+            self.multicast.stop_session(session_id)
+        self.refresh_view()
+        self.pxe.log(f"清空镜像任务：{deleted} 条")
+        QMessageBox.information(self, "清空完成", f"已清空 {deleted} 条任务记录。")
 
     def selected_client_mac(self) -> str:
         row = self.client_table.currentRow()
@@ -2965,6 +3779,43 @@ boot
                 if mac and mac not in macs:
                     macs.append(mac)
         return macs
+
+    def selected_client_records(self) -> list[dict]:
+        selection = self.client_table.selectionModel()
+        if selection is None:
+            return []
+        rows_by_mac = {
+            str(row.get("mac") or "").strip().lower(): row
+            for row in self.filtered_client_rows()
+        }
+        selected: list[dict] = []
+        for index in sorted(selection.selectedRows(), key=lambda item: item.row()):
+            mac_item = self.client_table.item(index.row(), 3)
+            mac = mac_item.text().strip().lower() if mac_item else ""
+            row = rows_by_mac.get(mac)
+            if row is not None:
+                selected.append(dict(row))
+        return selected
+
+    def edit_selected_clients(self):
+        clients = self.selected_client_records()
+        if not clients:
+            QMessageBox.information(
+                self, "请选择客户端",
+                "选择一台可直接修改；按 Ctrl/Shift 选择多台可按顺序批量修改。",
+            )
+            return
+        dialog = ClientIdentityEditDialog(clients, self.mask.text().strip(), self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        try:
+            updated = self.store.update_registration_identities(dialog.result_updates())
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "修改失败", str(exc))
+            return
+        self.refresh_view()
+        mode = "单台" if updated == 1 else "批量"
+        self.pxe.log(f"{mode}修改客户端IP/计算机名：{updated} 台")
 
     def registered_client_rows(self) -> list[dict]:
         registrations = self.store.registrations()
@@ -2989,12 +3840,23 @@ boot
                 online = now - seen_at <= 300
             except ValueError:
                 pass
+            source = dict(registration)
+            if node.get("inventory"):
+                source["inventory"] = node.get("inventory")
+            source["disk_analysis"] = analysis
+            hardware = client_hardware_info(source)
             rows.append({
                 "status": "在线" if online else "已注册",
                 "name": registration.get("name") or node.get("hostname") or "未命名客户端",
-                "ip": node.get("ip") or registration.get("ip") or "",
+                "ip": registration.get("ip") or node.get("configured_ip") or "",
+                "reported_ip": node.get("ip") or registration.get("reported_ip") or "",
                 "mac": mac,
                 "group": registration.get("group") or node.get("group") or "默认组",
+                "arch": hardware["arch"],
+                "cpu_model": hardware["cpu_model"],
+                "cpu_cores": hardware["cpu_cores"],
+                "memory_text": format_bytes_gib(hardware["memory_bytes"]),
+                "largest_disk_text": format_bytes_gib(hardware["largest_disk_bytes"]),
                 "disk_count": int(analysis.get("count") or 0),
                 "selected_disk": analysis.get("selected") or "",
                 "system_hint": analysis.get("system_hint") or "",
@@ -3011,16 +3873,36 @@ boot
     def refresh_clients(self, _index=None):
         selected_macs = set(self.selected_client_macs())
         rows = self.filtered_client_rows()
+        header = self.client_table.horizontalHeader()
+        sort_column = header.sortIndicatorSection()
+        sort_order = header.sortIndicatorOrder()
+        sorting_enabled = self.client_table.isSortingEnabled()
+
+        self.client_table.setSortingEnabled(False)
         self.client_table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             values = [
-                row["status"], row["name"], row["ip"], row["mac"],
-                row["group"], row["disk_count"], row["selected_disk"],
-                row["system_hint"], row["registered_at"],
+                row["status"], row["name"], row["ip"], row["mac"], row["group"],
+                row["arch"], row["cpu_model"], row["cpu_cores"], row["memory_text"],
+                row["largest_disk_text"], row["disk_count"], row["selected_disk"],
+                row["registered_at"],
             ]
             for column, value in enumerate(values):
-                self.client_table.setItem(index, column, QTableWidgetItem(str(value)))
-            if row["mac"] in selected_macs:
+                item = SortableTableWidgetItem(
+                    value, client_table_sort_key(column, value)
+                )
+                if column == 2 and row.get("reported_ip") and row.get("reported_ip") != row.get("ip"):
+                    item.setToolTip(f"当前PXE通信IP：{row['reported_ip']}")
+                self.client_table.setItem(index, column, item)
+
+        self.client_table.setSortingEnabled(sorting_enabled)
+        if sorting_enabled and sort_column >= 0:
+            self.client_table.sortItems(sort_column, sort_order)
+
+        for index in range(self.client_table.rowCount()):
+            mac_item = self.client_table.item(index, 3)
+            mac = mac_item.text().strip().lower() if mac_item else ""
+            if mac in selected_macs:
                 for column in range(self.client_table.columnCount()):
                     item = self.client_table.item(index, column)
                     if item:
@@ -3050,9 +3932,26 @@ boot
         selected_task_ids = set(self.selected_task_ids())
         self.sync_client_boot_scripts()
         self.refresh_clients()
-        rows = self.store.tasks()
+        registrations = {
+            str(item.get("mac") or "").lower(): item
+            for item in self.store.registrations() if item.get("mac")
+        }
+        rows = list(reversed(self.store.tasks()))
         self.table.setRowCount(len(rows))
         for index, row in enumerate(rows):
+            task_mac = str(row.get("target_mac") or row.get("mac") or "").lower()
+            registered = registrations.get(task_mac, {})
+            task_client_name = (
+                str(registered.get("name") or "")
+                if registered else str(row.get("hostname") or "")
+            ) or str(row.get("mac") or row.get("target_mac") or "")
+            task_client_ip = (
+                str(registered.get("ip") or "")
+                if registered else str(
+                    row.get("registered_ip") or row.get("client_ip")
+                    or row.get("identity_ip") or ""
+                )
+            )
             values = [
                 row.get("id", ""),
                 "下发" if row.get("action") == "deploy" else "上传",
@@ -3063,8 +3962,8 @@ boot
                 row.get("image_name", ""), row.get("device", ""),
                 post_action_text(str(row.get("post_action") or "none")),
                 row.get("status", ""),
-                row.get("hostname") or row.get("mac") or row.get("target_mac", ""),
-                row.get("client_ip") or row.get("identity_ip", ""),
+                task_client_name,
+                task_client_ip,
                 row.get("target_group", ""),
                 (
                     f"{float(row.get('progress_percent') or 0):.1f}%"

@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# The registry test double only needs a readable hive payload.
-printf '%s' "ZOS-NTFS-TEST-HIVE"
